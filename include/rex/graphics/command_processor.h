@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -22,6 +23,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/graphics/draw_skip.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
@@ -274,6 +276,14 @@ class CommandProcessor {
   }
   void ServeReadBackRequest();
 
+  // gpu_draw_counters (stage 1B, X9): what the guest's command stream asked the GPU for. The
+  // backends count draws, copies and ZPD events; this class counts swaps, VIZ_QUERY packets and
+  // ReadBackResolvedMemory calls. Logged, then reset, about every 10 s at a swap or the end of a
+  // primary buffer (command processor thread). The counting is a few increments a draw and runs
+  // either way; only the line depends on the setting.
+  void MaybeLogDrawCounters();
+  draw_skip::Counters draw_counters_;
+
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
@@ -327,6 +337,11 @@ class CommandProcessor {
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
 
  private:
+  // ReadBackResolvedMemory is called from guest threads, so its count is kept apart from
+  // draw_counters_ (command processor thread only).
+  std::atomic<uint64_t> readback_calls_{0};
+  std::chrono::steady_clock::time_point draw_counters_window_start_{};
+
   // Copies the noted resolves overlapping the range back (command processor thread).
   bool ReadBackNotedResolves(uint32_t address, uint32_t length);
 

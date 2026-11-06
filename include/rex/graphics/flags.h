@@ -35,6 +35,10 @@ REXCVAR_DECLARE(bool, readback_memexport);
 REXCVAR_DECLARE(bool, readback_memexport_fast);
 REXCVAR_DECLARE(bool, occlusion_query_enable);
 REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
+// Stage 1B of Swap Force Online: the GPU work counters and the hidden game's draw skip (both
+// defined in graphics/command_processor.cpp; rex/graphics/draw_skip.h).
+REXCVAR_DECLARE(bool, gpu_draw_counters);
+REXCVAR_DECLARE(bool, render_hidden_draw);
 
 // GPU Depth / Render Target Behavior
 REXCVAR_DECLARE(bool, depth_float24_round);

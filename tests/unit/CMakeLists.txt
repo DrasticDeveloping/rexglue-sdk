@@ -21,6 +21,7 @@ add_executable(unit_tests
     input/input_assignment_test.cpp
     graphics/shader_constant_overrides_test.cpp
     graphics/edram_layout_test.cpp
+    graphics/draw_skip_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp

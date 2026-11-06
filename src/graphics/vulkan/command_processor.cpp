@@ -2283,6 +2283,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   // vertex data the CPU rewrote in place is uploaded again once per frame.
   InvalidateAllVertexBufferResidency();
 
+  // Stage 1B of Swap Force Online: the draw skip (render_hidden_draw) and the draw, memexport,
+  // copy and occlusion query counts of gpu_draw_counters exist in the D3D12 backend only. Said
+  // once, here at a swap so that gpu_draw_counters turned on later (hot-reloadable) is caught
+  // too; on the command processor thread only, so a plain static is enough.
+  static bool d3d12_only_logged = false;
+  if (!d3d12_only_logged &&
+      (REXCVAR_GET(gpu_draw_counters) || !REXCVAR_GET(render_hidden_draw))) {
+    d3d12_only_logged = true;
+    REXGPU_WARN(
+        "GPU: gpu_draw_counters and the draw skip (render_hidden_draw) are D3D12-only: on Vulkan "
+        "draws, memexport, copies and zpd stay 0 and everything is drawn");
+  }
+
   if (!graphics_system_)
     return;
   ui::Presenter* presenter = graphics_system_->presenter();

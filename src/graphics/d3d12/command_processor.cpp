@@ -42,6 +42,13 @@
 REXCVAR_DECLARE(bool, present_use_actual_aspect);
 // Defined in ui/window.cpp.
 REXCVAR_DECLARE(std::string, resolution);
+// Defined in ui/window.cpp (restart-only): the window is never shown. The draw skip below acts only
+// with it, so a visible window can never lose its picture to render_hidden_draw.
+REXCVAR_DECLARE(bool, window_hidden);
+
+// render_hidden_draw (the hidden game's draw skip, stage 1B item 3) is defined in
+// graphics/command_processor.cpp and declared in rex/graphics/flags.h; this file is where it acts
+// (SetupContext, IssueDraw, IssueCopy, IssueSwap, EVENT_WRITE_ZPD).
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -185,7 +192,14 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
 
 bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
                                                                uint32_t packet, uint32_t count) {
-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
+  ++draw_counters_.zpd;  // gpu_draw_counters
+  // The draw skip: a host query around skipped draws would count 0 samples, and a game reading
+  // that would take everything for hidden. The base class's path writes the fixed fake count
+  // (query_occlusion_fake_sample_count, at least 1) at each query's end instead, "visible": what
+  // the game sees with occlusion_query_enable off. That differs from the real counts the host
+  // queries give without the skip, so P3 compares the game's events with the skip off and on.
+  if (skip_hidden_draws_ || !REXCVAR_GET(occlusion_query_enable) ||
+      !occlusion_query_resources_available_) {
     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
   }
 
@@ -1661,7 +1675,35 @@ bool D3D12CommandProcessor::SetupContext() {
                                             uint32_t(SystemBindlessView::kGammaRampPWLSRV)));
   }
 
-  occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+  // The hidden game's draw skip (render_hidden_draw), decided once: no occlusion query is open
+  // and no frame begun yet, so neither is cut in half by it. Resolve readback counts as it is now,
+  // at startup; turned on later, it is ignored while the skip is on (IssueCopy warns once).
+  switch (draw_skip::Decide(REXCVAR_GET(render_hidden_draw), REXCVAR_GET(window_hidden),
+                            GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve)) !=
+                                ReadbackResolveMode::kDisabled)) {
+    case draw_skip::Mode::kDraw:
+      skip_hidden_draws_ = false;
+      break;
+    case draw_skip::Mode::kSkip:
+      skip_hidden_draws_ = true;
+      REXGPU_INFO(
+          "GPU: draw skip on (render_hidden_draw off, window hidden): draws without memexport, "
+          "resolves and presents are skipped");
+      break;
+    case draw_skip::Mode::kRefusedReadback:
+      skip_hidden_draws_ = false;
+      REXGPU_WARN(
+          "GPU: draw skip refused: resolve readback is on, so the game reads render-to-texture "
+          "results on the CPU; drawing everything");
+      break;
+  }
+
+  // Under the skip no host occlusion query is ever begun (EVENT_WRITE_ZPD takes the base class's
+  // fake count), so the query heap and its readback buffer are not allocated; the members stay
+  // empty, occlusion_query_resources_available_ stays false (Begin/EndGuestOcclusionQuery return
+  // early on it), and ShutdownOcclusionQueryResources handles the empty members.
+  occlusion_query_resources_available_ =
+      skip_hidden_draws_ ? false : InitializeOcclusionQueryResources();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1995,6 +2037,21 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   InvalidateAllVertexBufferResidency();
   // A new frame gets the whole pipeline_wait_budget_ms again.
   pipeline_wait_used_us_ = 0;
+
+  if (skip_hidden_draws_) {
+    // The draw skip: no swap texture, no gamma or FXAA pass, no present (the window is hidden).
+    // Kept: the two lines above (the vertex buffer residency matters to the memexport draws that
+    // still run) and the frame boundary, BeginSubmission/EndSubmission(true), which closes the
+    // frame as the full path does (frame_current_, the texture cache's and the primitive
+    // processor's BeginFrame/EndFrame, deferred deletions, the memexport readback slots). The
+    // guest side of a swap is not here: the swap packet, guest_frame_count (counted in
+    // CommandProcessor::ExecutePacketType3_XE_SWAP after this returns) and the vblank interrupts
+    // (GraphicsSystem) run as before. Nothing the full path does here writes guest memory.
+    if (BeginSubmission(true)) {
+      EndSubmission(true);
+    }
+    return;
+  }
 
   if (!graphics_system_)
     return;
@@ -2414,6 +2471,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Special copy handling.
     return IssueCopy();
   }
+  ++draw_counters_.draws;  // gpu_draw_counters
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
@@ -2457,6 +2515,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+  if (memexport_used) {
+    ++draw_counters_.memexport;  // gpu_draw_counters
+  }
+
+  // The draw skip, after the shader analysis above: the same memexport test the full path uses,
+  // so a draw the full path would export memory from is never skipped. A draw without memexport
+  // writes only render targets (host EDRAM), which reach guest-visible state only through a
+  // resolve (skipped too, IssueCopy) and resolve readback (the skip is refused when it
+  // is on at startup, SetupContext); the guest CPU never reads them. Memexport draws are drawn;
+  // the one way one of them carries resolve bytes into guest memory is written in IssueCopy. A skipped draw also leaves out the primitive
+  // processor's index conversion, the shared memory uploads of its vertices, indices and
+  // textures, the render target cache update, shader translation and pipeline creation, the
+  // bindings, and the host occlusion query's samples (queries take the fake count,
+  // EVENT_WRITE_ZPD): all host state, rebuilt on demand by the next draw that runs. True: the
+  // packet was read, as for any draw with nothing to do.
+  if (draw_skip::SkipDraw(skip_hidden_draws_, memexport_used)) {
+    ++draw_counters_.skipped_draws;
+    return true;
+  }
 
   if (!BeginSubmission(true)) {
     return false;
@@ -3023,6 +3100,37 @@ bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  ++draw_counters_.copies;  // gpu_draw_counters
+  if (skip_hidden_draws_) {
+    // The draw skip. A resolve copies EDRAM into the GPU's copy of guest memory (shared memory)
+    // and may clear EDRAM; with resolve readback off (the skip is refused when it is on at
+    // startup) it writes no guest memory: the guest CPU sees a resolve's bytes only through
+    // readback_resolve or
+    // ReadBackResolvedMemory, and the game calls the latter nowhere (no caller in the game, the
+    // portal or the SDK; gpu_draw_counters counts calls). Left out, all GPU side: the copy and
+    // clear dispatches, the texture cache's invalidation of the range (MarkRangeAsResolved, so
+    // textures there keep the CPU's bytes), the shared memory's GPU-written marking, and
+    // NoteResolvedRange, so a ReadBackResolvedMemory call finds nothing resolved and returns
+    // false ("the caller reads what the CPU has") instead of copying stale GPU bytes over guest
+    // memory. Nothing guest-visible is kept because a resolve does nothing guest-visible here.
+    // The readers left on the GPU: a memexport draw (still run) sampling a texture a resolve made
+    // now reads the CPU's bytes there; and a memexport draw whose export range overlaps a resolve
+    // destination, with memexport readback on (the default), copies that range back into guest
+    // memory, which on the full path carries the resolve's bytes there and under the skip the
+    // CPU's older ones. So the skip is trusted only while gpu_draw_counters shows memexport 0
+    // (X9). Resolve readback turned on after startup (readback_resolve and d3d12_readback_resolve
+    // are hot-reloadable) does not undo the skip, decided once in SetupContext: it is ignored
+    // until a restart, with one warning.
+    if (!warned_readback_under_skip_ &&
+        GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve)) !=
+            ReadbackResolveMode::kDisabled) {
+      warned_readback_under_skip_ = true;
+      REXGPU_WARN(
+          "GPU: resolve readback turned on while the draw skip is on: ignored until restart");
+    }
+    ++draw_counters_.skipped_copies;
+    return true;
+  }
   if (!BeginSubmission(true)) {
     return false;
   }
