@@ -10,10 +10,14 @@
  * pump included, and all clients dropped the server. With log_async a log call only queues the line.
  *
  * Each case starts and ends with ShutdownLogging, because InitLogging decides the mode once.
+ * The "log switch" cases cover EnableAsyncLogging, the one-way run-time switch an online client
+ * makes at its first session (P1n, run 20261107-014744-log-stall: a client's synchronous file sink
+ * stalled 24 s and its pump dropped the session); a drained ShutdownLogging also resets it.
  */
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -22,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -504,22 +509,31 @@ TEST_CASE("log_async: a crash handler's urgent lines wait for room only once", "
 namespace {
 
 // Runs `on_first` on the writer, inside this sink (its lock held), on its first line: a crash
-// handler running on the crashing writer thread.
+// handler running on the crashing writer thread. With `trigger`, on the first line whose text is
+// exactly that, so the SDK's own lines cannot fire it: after a ShutdownLogging the built-in
+// categories keep their cached ids (rex::log::core() is a function-local static), so in a later
+// Session the case's own category can share core's id and get lines like `Log: asynchronous from
+// now on` (the switch cases; Sol's review of the switch, finding 1).
 class CrashSink final : public spdlog::sinks::base_sink<std::mutex> {
  public:
-  explicit CrashSink(std::function<void()> on_first) : on_first_(std::move(on_first)) {}
+  explicit CrashSink(std::function<void()> on_first, std::string trigger = {})
+      : on_first_(std::move(on_first)), trigger_(std::move(trigger)) {}
 
  protected:
-  void sink_it_(const spdlog::details::log_msg&) override {
-    if (!fired_) {
-      fired_ = true;
-      on_first_();
-    }
+  void sink_it_(const spdlog::details::log_msg& msg) override {
+    if (fired_)
+      return;
+    if (!trigger_.empty() &&
+        std::string_view(msg.payload.data(), msg.payload.size()) != trigger_)
+      return;
+    fired_ = true;
+    on_first_();
   }
   void flush_() override {}
 
  private:
   std::function<void()> on_first_;
+  const std::string trigger_;
   bool fired_ = false;
 };
 
@@ -788,6 +802,392 @@ TEST_CASE("log_async: if the exit watchdog cannot start, logging stays synchrono
   }
 }
 
+namespace {
+
+// The category's logger now: a switch replaces it, so the switch cases fetch it for every call (as
+// the macros do), never through Session::logger, which keeps the logger from before the switch.
+spdlog::logger* Raw(const Session& session) {
+  return rex::GetLoggerRaw(session.category);
+}
+
+bool IsAsync(const spdlog::logger* logger) {
+  return dynamic_cast<const spdlog::async_logger*>(logger) != nullptr;
+}
+
+// Waits (polling, at most `bound`) until `stall` is inside its write or flush.
+bool WaitStallEntered(StallSink& stall, milliseconds bound) {
+  const auto until = Clock::now() + bound;
+  while (!stall.Entered()) {
+    if (Clock::now() >= until)
+      return false;
+    std::this_thread::sleep_for(milliseconds(1));
+  }
+  return true;
+}
+
+}  // namespace
+
+// --- EnableAsyncLogging: the run-time switch (the owner's decision of 2026-11-07, after P1n) -----
+// A client logs synchronously until its first online session, then switches for good. These cases
+// cover what can break: the swap under concurrent logging, pointers taken before it, that it never
+// waits on a sink, its lock bound, and the exit invariant from the switch on (amendment aj/am).
+
+TEST_CASE("log switch: EnableAsyncLogging while four threads log", "[log_async]") {
+  // U1: every line arrives once, each thread's lines in order across the switch; a second call is
+  // a no-op. Ten rounds, since the switch lands at a different point each time.
+  for (int round = 0; round < 10; ++round) {
+    INFO("round " << round);
+    auto collect = std::make_shared<CollectSink>();
+    Session session(false, 8192, spdlog::level::off, collect);
+    spdlog::logger* before = Raw(session);
+    REQUIRE(before);
+    REQUIRE_FALSE(rex::LogAsyncActive());
+    REQUIRE_FALSE(IsAsync(before));
+
+    constexpr int kThreads = 4;
+    constexpr int kLines = 20000;
+    std::atomic<int> produced{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+      threads.emplace_back([&, t] {
+        const std::string tag = "t" + std::to_string(t);
+        for (int i = 0; i < kLines; ++i) {
+          Raw(session)->info("{} {}", tag, i);
+          ++produced;
+        }
+      });
+    }
+    const bool waited = WaitCount(produced, 1000, milliseconds(10000));
+    const bool switched = rex::EnableAsyncLogging();
+    for (auto& thread : threads)
+      thread.join();
+    rex::FlushLogging();
+    REQUIRE(waited);
+    CHECK(switched);
+    CHECK(rex::LogAsyncActive());
+    spdlog::logger* after = Raw(session);
+    CHECK(after != before);
+    CHECK(IsAsync(after));
+    const auto lines = collect->Lines();
+    for (int t = 0; t < kThreads; ++t)
+      CHECK(InOrder(lines, "t" + std::to_string(t), kLines));  // each once, in order
+
+    // Idempotent: no second switch (the logger stays the same object).
+    CHECK(rex::EnableAsyncLogging());
+    CHECK(Raw(session) == after);
+  }
+}
+
+TEST_CASE("log switch: a thread's lines across two categories keep their order", "[log_async]") {
+  // U1b (Sol, narrow round on the switch, F1): one thread alternates its lines between two
+  // categories that share a sink while the switch happens. Swapped category by category, line n
+  // could be queued through an already asynchronous category and line n+1 written synchronously
+  // through one not yet swapped, so n+1 reached the sink first. With the one-publication table the
+  // thread's lines arrive in order. Many rounds, so the switch lands at different points.
+  for (int round = 0; round < 50; ++round) {
+    INFO("round " << round);
+    auto collect = std::make_shared<CollectSink>();
+    Session session(false, 8192, spdlog::level::off, collect);
+    const rex::LogCategoryId second = rex::RegisterLogCategory("test.log_async.second");
+    REQUIRE(rex::GetLoggerRaw(second));
+    constexpr int kLines = 40000;
+    std::atomic<int> produced{0};
+    std::thread writer([&] {
+      for (int i = 0; i < kLines; ++i) {
+        spdlog::logger* logger = (i % 2 == 0) ? Raw(session) : rex::GetLoggerRaw(second);
+        logger->info("n {}", i);
+        ++produced;
+      }
+    });
+    const bool waited = WaitCount(produced, 2000, milliseconds(10000));
+    const bool switched = rex::EnableAsyncLogging();
+    writer.join();
+    rex::FlushLogging();
+    REQUIRE(waited);
+    CHECK(switched);
+    const auto lines = collect->Lines();
+    int expect = 0;
+    bool in_order = true;
+    for (const auto& line : lines) {
+      if (line.rfind("n ", 0) != 0)
+        continue;  // the switch's own line and others
+      if (line != "n " + std::to_string(expect)) {
+        in_order = false;
+        break;
+      }
+      ++expect;
+    }
+    CHECK(in_order);
+    CHECK(expect == kLines);  // every line once
+  }
+}
+
+// U1c: what the switch's publish hook saw (see U1c).
+rex::LogCategoryId g_u1c_first{0};
+rex::LogCategoryId g_u1c_second{0};
+std::atomic<int> g_u1c_calls{0};
+std::atomic<bool> g_u1c_first_async{true};
+std::atomic<bool> g_u1c_second_async{true};
+size_t g_u1c_sync = 0;   // every registered category's mode at the hook (the root-cause repair)
+size_t g_u1c_async = 0;
+void U1cHook() {
+  g_u1c_first_async = dynamic_cast<const spdlog::async_logger*>(rex::GetLoggerRaw(g_u1c_first)) != nullptr;
+  g_u1c_second_async = dynamic_cast<const spdlog::async_logger*>(rex::GetLoggerRaw(g_u1c_second)) != nullptr;
+  rex::LoggerModeCountsForTesting(g_u1c_sync, g_u1c_async);
+  ++g_u1c_calls;
+}
+
+TEST_CASE("log switch: no category is asynchronous before the one publication", "[log_async]") {
+  // U1c (Sol, narrow round on the switch, M1), deterministic: at the last instant before
+  // EnableAsyncLogging publishes its replacement table, every category still reads synchronous
+  // through GetLoggerRaw, and right after it every category reads asynchronous. The round-1 code
+  // swapped categories one by one, so at any point between its first and last swap one category
+  // read asynchronous and another synchronous: wherever a hook sat between those stores, this
+  // test fails on it. (U1b keeps the timing-based line-order check as a stress test.)
+  auto collect = std::make_shared<CollectSink>();
+  Session session(false, 8192, spdlog::level::off, collect);
+  g_u1c_first = session.category;
+  g_u1c_second = rex::RegisterLogCategory("test.log_async.u1c");
+  REQUIRE(rex::GetLoggerRaw(g_u1c_second));
+  // The switch's own line goes through the core category, which registers on its first use. If
+  // this process has not used it yet, that registration would come after the publication (as an
+  // asynchronous category) and the count after the switch would be one higher than at the hook.
+  // Using it here registers it now, if it is not registered yet, so both counts see the same
+  // categories.
+  (void)::rex::log::core();
+  g_u1c_calls = 0;
+  rex::SetSwitchPublishHookForTesting(&U1cHook);
+  const bool switched = rex::EnableAsyncLogging();
+  rex::SetSwitchPublishHookForTesting(nullptr);
+  REQUIRE(switched);
+  CHECK(g_u1c_calls.load() == 1);              // the publication happened once
+  CHECK_FALSE(g_u1c_first_async.load());       // still synchronous just before it
+  CHECK_FALSE(g_u1c_second_async.load());
+  CHECK(IsAsync(rex::GetLoggerRaw(g_u1c_first)));   // both asynchronous right after it
+  CHECK(IsAsync(rex::GetLoggerRaw(g_u1c_second)));
+  // EVERY registered category, not a sample: at the hook none is asynchronous, after it none is
+  // synchronous. Any per-category publication has async > 0 at its last instant before the final
+  // store, whatever its order (the root-cause analysis future/rca-log-switch-M1.md).
+  const size_t categories = g_u1c_sync + g_u1c_async;
+  CHECK(categories >= 2);
+  CHECK(g_u1c_async == 0);
+  CHECK(g_u1c_sync == categories);
+  size_t sync_after = 0, async_after = 0;
+  rex::LoggerModeCountsForTesting(sync_after, async_after);  // nothing else logs or registers now
+  CHECK(sync_after == 0);
+  CHECK(async_after == categories);
+}
+
+TEST_CASE("log switch: pointers taken before the switch stay valid and synchronous", "[log_async]") {
+  // U2: the replaced loggers are never freed; the new one has the old one's sinks and level; the
+  // switch leaves spdlog's default logger alone (no drop, no set_default_logger).
+  Session session(false, 8192, spdlog::level::off);
+  auto extra = std::make_shared<CollectSink>();
+  rex::AddSink(session.category, extra);
+  rex::SetCategoryLevel(session.category, spdlog::level::warn);
+  spdlog::logger* raw = Raw(session);
+  std::shared_ptr<spdlog::logger> held = rex::GetLogger(session.category);
+  REQUIRE(raw);
+  REQUIRE(raw == held.get());
+  spdlog::logger* default_before = spdlog::default_logger_raw();
+
+  REQUIRE(rex::EnableAsyncLogging());
+  spdlog::logger* now = Raw(session);
+  REQUIRE(now != raw);
+  CHECK(IsAsync(now));
+  CHECK_FALSE(IsAsync(raw));
+
+  // The old objects log synchronously: in the sink when the call returns, no FlushLogging.
+  raw->warn("old raw");
+  held->warn("old held");
+  CHECK(Contains(extra->Lines(), "old raw"));
+  CHECK(Contains(extra->Lines(), "old held"));
+
+  CHECK(now->level() == spdlog::level::warn);
+  CHECK(now->flush_level() == raw->flush_level());
+  CHECK(now->sinks() == raw->sinks());  // the category's own sink came along
+  REXLOG_CAT_INFO(session.category, "filtered info");
+  REXLOG_CAT_WARN(session.category, "new warn");
+  rex::FlushLogging();
+  CHECK_FALSE(Contains(extra->Lines(), "filtered info"));
+  CHECK(Contains(extra->Lines(), "new warn"));
+  CHECK(spdlog::default_logger_raw() == default_before);
+}
+
+TEST_CASE("log switch: neither the switch nor the switched threads wait on a blocked sink",
+          "[log_async]") {
+  // U3, P1n as a unit test: thread A is inside a blocked sink with a synchronous line (a disk
+  // stall); the switch returns at once, and thread C's lines after it only queue.
+  Session session(false, 8192, spdlog::level::off);
+  auto latch = std::make_shared<LatchSink>();
+  rex::AddSink(session.category, latch);
+  Watchdog guard(milliseconds(10000), [&] { latch->Release(); });
+
+  std::thread a([&] { Raw(session)->info("A first"); });
+  REQUIRE(latch->WaitEntered(milliseconds(2000)));
+
+  std::atomic<bool> switched{false};
+  std::atomic<int64_t> switch_ms{-1};
+  std::thread b([&] {
+    const auto began = Clock::now();
+    switched = rex::EnableAsyncLogging();
+    switch_ms = MsBetween(began, Clock::now());
+  });
+  b.join();
+  CHECK(switched.load());
+  CHECK(switch_ms.load() < 100);
+
+  constexpr int kLines = 100;
+  std::atomic<int64_t> slowest_ms{0};
+  std::thread c([&] {
+    for (int i = 0; i < kLines; ++i) {
+      const auto began = Clock::now();
+      Raw(session)->info("C {}", i);
+      slowest_ms = std::max<int64_t>(slowest_ms.load(), MsBetween(began, Clock::now()));
+    }
+  });
+  c.join();
+  CHECK(slowest_ms.load() < 50);
+  CHECK(latch->Lines().empty());  // A still holds the sink
+
+  latch->Release();
+  a.join();
+  rex::FlushLogging();
+  const auto lines = latch->Lines();
+  REQUIRE_FALSE(lines.empty());
+  CHECK(lines.front() == "A first");
+  CHECK(InOrder(lines, "C", kLines));
+}
+
+TEST_CASE("log switch: a busy log lock makes the switch give up within its bound", "[log_async]") {
+  // U4: a synchronous FlushLogging stuck in a sink's flush holds the log lock. The switch gives up
+  // after 3 s, changes nothing, and leaves no mark: a later call switches.
+  Session session(false, 8192, spdlog::level::off);
+  auto stall = std::make_shared<StallSink>(StallSink::Where::kFlush);
+  rex::AddSink(session.category, stall);
+  Watchdog guard(milliseconds(10000), [&] { stall->Release(); });
+  spdlog::logger* before = Raw(session);
+
+  std::thread a([] { rex::FlushLogging(); });
+  REQUIRE(WaitStallEntered(*stall, milliseconds(2000)));
+  const auto began = Clock::now();
+  const bool switched = rex::EnableAsyncLogging();
+  const int64_t took = MsBetween(began, Clock::now());
+  CHECK_FALSE(switched);
+  CHECK(took >= 2900);
+  CHECK(took < 3500);
+  CHECK_FALSE(rex::LogAsyncActive());
+  CHECK(Raw(session) == before);
+
+  stall->Release();
+  a.join();
+  CHECK(rex::EnableAsyncLogging());
+  CHECK(rex::LogAsyncActive());
+  CHECK(IsAsync(Raw(session)));
+}
+
+TEST_CASE("log switch: level changes never wait on a sink", "[log_async]") {
+  // U8 (the review of 2026-11-07, finding 4): a synchronous FlushLogging stuck in a sink's flush
+  // holds the log lock (offline play, a disk stall); the level setters, the log_level callback's
+  // path and GetLogger take only the level lock, so they return at once, as before the switch.
+  Session session(false, 8192, spdlog::level::off);
+  auto stall = std::make_shared<StallSink>(StallSink::Where::kFlush);
+  rex::AddSink(session.category, stall);
+  Watchdog guard(milliseconds(10000), [&] { stall->Release(); });
+
+  std::thread a([] { rex::FlushLogging(); });
+  REQUIRE(WaitStallEntered(*stall, milliseconds(2000)));
+  const auto began = Clock::now();
+  rex::SetCategoryLevel(session.category, spdlog::level::warn);
+  rex::SetRootLevel(session.category, spdlog::level::err);
+  rex::SetAllLevels(spdlog::level::trace);
+  std::shared_ptr<spdlog::logger> held = rex::GetLogger(session.category);
+  const int64_t took = MsBetween(began, Clock::now());
+  CHECK(took < 100);
+  REQUIRE(held);
+  CHECK(held->level() == spdlog::level::trace);
+
+  stall->Release();
+  a.join();
+}
+
+TEST_CASE("log switch: the exit watchdog arms only from the switch on", "[log_async]") {
+  // U5: before the switch (offline play) ArmExitWatchdog does nothing; after it, it arms, and a
+  // crash on the writer right after the switch arms it and still reaches the other sinks.
+  Session session(false, 8192, spdlog::level::off);
+  auto collect = std::make_shared<CollectSink>();
+  std::atomic<bool> handled{false};
+  // Fires only on the case's "crash" line, never on the switch's own `Log: asynchronous` line,
+  // which can share this category (see CrashSink).
+  auto crash = std::make_shared<CrashSink>(
+      [&] {
+        rex::LogUrgent(session.category, spdlog::level::err, "Crash: on the writer");
+        rex::FlushLogging();
+        handled = true;
+      },
+      "crash");
+  rex::AddSink(session.category, collect);
+  rex::AddSink(session.category, crash);
+
+  rex::ArmExitWatchdog();
+  CHECK_FALSE(rex::ExitWatchdogArmedForTesting());
+
+  REQUIRE(rex::EnableAsyncLogging());
+  rex::ArmExitWatchdog();
+  CHECK(rex::ExitWatchdogArmedForTesting());
+  rex::SetExitWatchdogHookForTesting(&CountWatchdog);  // disarms
+  REQUIRE_FALSE(rex::ExitWatchdogArmedForTesting());
+
+  Raw(session)->info("crash");
+  const auto until = Clock::now() + milliseconds(5000);
+  while (!handled.load() && Clock::now() < until)
+    std::this_thread::sleep_for(milliseconds(5));
+  REQUIRE(handled.load());
+  CHECK(rex::ExitWatchdogArmedForTesting());  // WriteOnWriter armed it
+  CHECK(Contains(collect->Lines(), "Crash: on the writer"));
+  rex::SetExitWatchdogHookForTesting(&CountWatchdog);
+}
+
+TEST_CASE("log switch: if the exit watchdog cannot start, the switch is refused for the process",
+          "[log_async]") {
+  // U6: no pool, the same synchronous logger, nothing armable; a later call is refused at once
+  // (it does not even wait for a busy log lock); clearing the injection lets the switch through.
+  struct Injected {  // cleared however the case ends, so the later cases switch normally
+    Injected() { rex::SetExitWatchdogStartFailureForTesting(true); }
+    ~Injected() { rex::SetExitWatchdogStartFailureForTesting(false); }
+  };
+  Session session(false, 8192, spdlog::level::off);
+  auto collect = std::make_shared<CollectSink>();
+  auto stall = std::make_shared<StallSink>(StallSink::Where::kFlush);
+  rex::AddSink(session.category, collect);
+  rex::AddSink(session.category, stall);
+  Watchdog guard(milliseconds(10000), [&] { stall->Release(); });
+  spdlog::logger* before = Raw(session);
+  auto injected = std::make_unique<Injected>();
+
+  CHECK_FALSE(rex::EnableAsyncLogging());
+  CHECK_FALSE(rex::LogAsyncActive());
+  CHECK(Raw(session) == before);
+  CHECK_FALSE(IsAsync(Raw(session)));
+  Raw(session)->info("sync line");
+  CHECK(Contains(collect->Lines(), "sync line"));  // synchronous: no FlushLogging
+  rex::ArmExitWatchdog();
+  CHECK_FALSE(rex::ExitWatchdogArmedForTesting());
+
+  // Refused for the process: returns before the log lock, which a stuck FlushLogging holds now.
+  std::thread a([] { rex::FlushLogging(); });
+  REQUIRE(WaitStallEntered(*stall, milliseconds(2000)));
+  const auto began = Clock::now();
+  CHECK_FALSE(rex::EnableAsyncLogging());
+  CHECK(MsBetween(began, Clock::now()) < 500);
+  stall->Release();
+  a.join();
+
+  injected.reset();  // also clears the refusal
+  CHECK(rex::EnableAsyncLogging());
+  CHECK(IsAsync(Raw(session)));
+}
+
 #if defined(_WIN32)
 
 namespace {
@@ -956,6 +1356,83 @@ TEST_CASE("log_async: a process whose exit watchdog cannot start logs synchronou
         std::string::npos);
   CHECK(run.text.find("Log: asynchronous") == std::string::npos);
   CHECK(run.text.find("child: async 0, synchronous logger 1\n") != std::string::npos);
+}
+
+constexpr const char* kSwitchWatchdogChildVar = "REX_LOG_SWITCH_WATCHDOG_CHILD";
+constexpr const char* kSwitchRefusedChildVar = "REX_LOG_SWITCH_REFUSED_CHILD";
+
+// The child of the next case (hidden; does nothing unless started by it): synchronous at init, as
+// a client is, then the switch, then a crash on the writer with a sink that never returns.
+TEST_CASE("log switch: exit watchdog child", "[.][log_switch_watchdog_child]") {
+  char path[1024] = {};
+  const DWORD n = GetEnvironmentVariableA(kSwitchWatchdogChildVar, path, sizeof(path));
+  if (n == 0 || n >= sizeof(path)) {
+    SUCCEED("not started as the switch watchdog child");
+    return;
+  }
+  Session session(false, 1024, spdlog::level::off);
+  auto file = std::make_shared<FileLineSink>(path);
+  auto stall = std::make_shared<StallSink>(StallSink::Where::kLog);
+  auto crash = std::make_shared<CrashSink>(
+      [&] {
+        rex::LogUrgent(session.category, spdlog::level::err, "Crash: on the writer");
+        rex::FlushLogging();
+      },
+      "crash");  // not on the switch's own line (see CrashSink)
+  // The sinks after the switch (AddSink lets the writer finish the switch's own line first), so the
+  // stall sink cannot catch that line either if this category shares core's id (see CrashSink).
+  REQUIRE(rex::EnableAsyncLogging());
+  rex::AddSink(session.category, file);
+  rex::AddSink(session.category, crash);
+  rex::AddSink(session.category, stall);
+  rex::SetExitWatchdogHookForTesting(nullptr);  // the real end of the process
+  rex::GetLoggerRaw(session.category)->info("crash");
+  std::this_thread::sleep_for(milliseconds(20000));
+  stall->Release();
+  FAIL("the exit watchdog did not end the process");
+}
+
+TEST_CASE("log switch: the exit watchdog ends a crash stuck on the writer after the switch",
+          "[log_async]") {
+  // U7: the existing watchdog child's case, entered through EnableAsyncLogging instead of
+  // InitLogging: exit code 3, 4 s after the crash (plus the child's start), the line in the file.
+  const ChildRun run = RunChild(L"[log_switch_watchdog_child]", kSwitchWatchdogChildVar, 15000);
+  CHECK(run.ended);
+  CHECK(run.code == 3);
+  CHECK(run.took_ms >= 4000);
+  CHECK(run.took_ms < 7000);
+  CHECK(run.text.find("Crash: on the writer\n") != std::string::npos);
+}
+
+// The child of the next case (hidden; does nothing unless started by it): a process whose exit
+// watchdog cannot start (injected) tries the switch, initializing its logging once, as the game does.
+TEST_CASE("log switch: refused switch child", "[.][log_switch_refused_child]") {
+  char path[1024] = {};
+  const DWORD n = GetEnvironmentVariableA(kSwitchRefusedChildVar, path, sizeof(path));
+  if (n == 0 || n >= sizeof(path)) {
+    SUCCEED("not started as the refused switch child");
+    return;
+  }
+  auto file = std::make_shared<FileLineSink>(path);
+  Session session(false, 8192, spdlog::level::info, file);
+  rex::SetExitWatchdogStartFailureForTesting(true);
+  const bool switched = rex::EnableAsyncLogging();
+  spdlog::logger* logger = rex::GetLoggerRaw(session.category);
+  REQUIRE(logger);
+  logger->info("child: switch {}, async {}, synchronous logger {}", switched ? 1 : 0,
+               rex::LogAsyncActive() ? 1 : 0, dynamic_cast<spdlog::async_logger*>(logger) ? 0 : 1);
+}
+
+TEST_CASE("log switch: a refused switch says so and logs synchronously", "[log_async]") {
+  // U6's warning, in a fresh process (see the refused-start case above for why): the watchdog
+  // warning through the synchronous sinks, no `Log: asynchronous` line, a synchronous logger.
+  const ChildRun run = RunChild(L"[log_switch_refused_child]", kSwitchRefusedChildVar, 15000);
+  CHECK(run.ended);
+  CHECK(run.code == 0);
+  CHECK(run.text.find("Log: the exit watchdog did not start; logging stays synchronous\n") !=
+        std::string::npos);
+  CHECK(run.text.find("Log: asynchronous") == std::string::npos);
+  CHECK(run.text.find("child: switch 0, async 0, synchronous logger 1\n") != std::string::npos);
 }
 
 #endif  // _WIN32

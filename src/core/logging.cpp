@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <charconv>
@@ -65,8 +66,11 @@ REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in s
 // a disk write. Why: the dedicated server's synchronous file flush stalled about 16 s under the sink
 // lock in run 20261106-211124 (P1m); its network pump thread waited on that lock to log one line,
 // and every client dropped the server on its 10 s peer timeout. Safe: the default is off, so the
-// other games and offline play keep today's synchronous loggers; the online client turns it on only
-// for its dedicated server (--log_async=true in the server's command line). Lines from all threads
+// other games and offline play keep today's synchronous loggers; the online client turns it on for
+// its dedicated server (--log_async=true in the server's command line), and a client switches to
+// the same mode at run time at its first online session (EnableAsyncLogging below; the owner's
+// decision of 2026-11-07, "1 but only online"), so play before any Host or Join keeps the
+// synchronous loggers. Lines from all threads
 // keep one order (one writer) and keep the time and thread of the call; FlushLogging and
 // ShutdownLogging drain the queue (bounded at 3 s) so the lines before a hard exit reach the disk.
 // It takes effect only with a running exit watchdog: if that cannot start, the loggers stay
@@ -292,22 +296,102 @@ bool g_initialized = false;
 // Timed, so that FlushLogging can give up at its deadline when another thread holds it (another
 // FlushLogging waiting for a stuck writer).
 std::timed_mutex g_mutex;
+// The level lock (2026-11-07, amendment an): guards g_registry's storage and each entry's logger
+// and has_explicit_level against the level setters (SetCategoryLevel, SetAllLevels, SetRootLevel,
+// the log_level callback) and GetLogger, which take this lock alone. Whoever changes those fields
+// holds g_mutex first, then this, and only around the change itself (a push_back, a pointer swap, a
+// set_level): never across a sink call or a logger's construction. Why its own lock: g_mutex is
+// held for a whole synchronous FlushLogging (24 s in a disk stall, P1n), and the setters must not
+// wait on that (the log_level callback runs under the cvar registry's lock); before the run-time
+// switch the setters took no lock at all, so offline play waits on nothing new. Lock order: g_mutex,
+// then this; nothing is taken while it is held.
+std::mutex g_level_mutex;
 LogConfig g_config;
+
+// The loggers by category id for GetLoggerRaw, readable on any thread without g_mutex. Written
+// (release) under g_mutex and g_level_mutex wherever a category's logger is set (SetEntryLogger
+// and SetEntryLoggerLocked: InitLoggingEarly, InitLogging, RegisterLogCategory,
+// RegisterLogSubcategory, EnableAsyncLogging) and cleared by ShutdownLogging, so it always names
+// the same logger as g_registry. One slot per possible id (LogCategoryId is 16 bits):
+// zero-initialized static storage (constinit, no dynamic init), so only the page that holds the
+// used slots is ever touched. Why: EnableAsyncLogging replaces loggers
+// while other threads log, and reading g_registry[id].logger (a shared_ptr) while it is assigned is
+// a data race; the table also takes GetLoggerRaw off g_registry, which a registration can
+// reallocate. Without a switch GetLoggerRaw returns the same pointer as before, from the same
+// moments on, through one acquire load (a plain load on x64).
+using LoggerTable = std::array<std::atomic<spdlog::logger*>, 65536>;
+constinit LoggerTable g_raw{};
+
+// The table GetLoggerRaw reads: g_raw until EnableAsyncLogging publishes a complete replacement
+// with one release store (Sol, narrow round on the switch, F1). Swapping category by category let a
+// thread see category A asynchronous and category B still synchronous, so its queued line through A
+// could reach a shared sink after its later synchronous line through B. With one publication a
+// thread sees the old table or the new one, never a mix, and since the pointer only ever moves
+// forward (old -> new, once per process), a thread that saw the new table never sees the old one
+// again: its lines stay in order across categories. The replacement is allocated once and never
+// freed (like g_retired): a reader may still be loading a slot from it. Writers (SetEntryLoggerLocked)
+// hold g_mutex and g_level_mutex and write the current table.
+std::atomic<LoggerTable*> g_table{&g_raw};
+
+// The synchronous loggers EnableAsyncLogging replaced. Allocated once, never freed (also not at
+// static teardown): a thread that took the old pointer from GetLoggerRaw just before the swap may
+// still be inside its log call, a GetLogger holder keeps using it, spdlog's default logger stays
+// the old "core" one (EnableAsyncLogging never calls spdlog::drop or set_default_logger), and
+// spdlog's own map keeps them (EnableAsyncLogging does not touch it either; see there).
+// Under g_mutex; one set of loggers per switch, and a process switches at most once (unit tests:
+// once per drained ShutdownLogging).
+std::vector<std::shared_ptr<spdlog::logger>>* g_retired = nullptr;
+
+// Every category logger is asynchronous now (InitLogging with log_async, or EnableAsyncLogging after
+// its swaps); EnableAsyncLogging's fast path. Set under g_mutex, cleared by ShutdownLogging.
+std::atomic<bool> g_loggers_async{false};
+
+// Sets a category's logger in g_registry and in g_raw together, so the two never drift apart.
+// Caller holds g_mutex and g_level_mutex; `id` is a registered entry.
+void SetEntryLoggerLocked(size_t id, std::shared_ptr<spdlog::logger> logger) {
+  spdlog::logger* raw = logger.get();
+  g_registry[id].logger = std::move(logger);
+  (*g_table.load(std::memory_order_relaxed))[id].store(raw, std::memory_order_release);
+}
+
+// The same, taking g_level_mutex itself. Caller holds g_mutex (and not g_level_mutex); the logger is
+// made before the call, so its construction is outside the level lock.
+void SetEntryLogger(size_t id, std::shared_ptr<spdlog::logger> logger) {
+  std::lock_guard level_lock(g_level_mutex);
+  SetEntryLoggerLocked(id, std::move(logger));
+}
 
 // --- Asynchronous mode (log_async) ---------------------------------------------------------------
 // THE EXIT INVARIANT (the root-cause analysis after Sol's narrow round B round 3; docs/online-1B.md
-// amendment aj). With log_async every exit path (crash, fatal error, abort) ends within a bound,
-// whatever the sinks, the queue and the writer do. One mechanism guarantees it, and it has one
-// precondition:
+// amendment aj, widened by the run-time switch of amendment an). In async mode every exit path
+// (crash, fatal error, abort) ends within a bound, whatever the sinks, the queue and the writer do.
+// One mechanism guarantees it, and it has one precondition:
+// - Async mode has two entries and one start sequence: InitLogging with log_async (S, from its
+//   start) and EnableAsyncLogging (a client, at its first online session; one-way, it stays on for
+//   the rest of the process). Both run the same sequence under g_mutex (MakeAsyncLocked, then
+//   PublishAsyncLocked; StartAsyncLocked for InitLogging): the watchdog's thread, then the pool,
+//   then armable (g_exit_watchdog_live), then the drain mark; only after the publish does any logger
+//   turn asynchronous. EnableAsyncLogging also builds every asynchronous logger between the two
+//   (on the made, unpublished pool), so a failure there publishes nothing either. Before a switch
+//   nothing of it exists (no watchdog thread, no pool, nothing armable): play before any session is
+//   the plain synchronous logging of every other game, crashes included.
 // - The bound is the exit watchdog's: kExitBound (4 s) after the first ArmExitWatchdog, then
 //   TerminateProcess (std::_Exit elsewhere) with exit code 3. Nothing else guarantees the bound.
-// - Async mode exists only while the watchdog runs. InitLogging starts the watchdog before it
-//   creates the pool or makes any logger asynchronous; if the watchdog cannot start, log_async
-//   counts as off for the process (synchronous loggers as in every other game, one warning through
-//   the synchronous sinks, no pool). The watchdog is never stopped while a pool exists: its thread
-//   lives until the process ends, and ShutdownLogging stops it from being armed only after the pool
-//   is gone (never for a pool left to the exit behind a stuck writer). ArmExitWatchdog does nothing
-//   without async mode.
+// - Async mode exists only while the watchdog runs. If the watchdog cannot start (or the pool or,
+//   at a switch, an asynchronous logger cannot be made), async mode is refused for the process
+//   (g_log_async_refused): no pool, the loggers stay the same synchronous objects, one warning
+//   through the synchronous sinks, and every later EnableAsyncLogging returns false at once. The
+//   watchdog is never stopped while a pool exists: its thread lives until the process ends, and
+//   ShutdownLogging stops it from being armed only after the pool is gone (never for a pool left to
+//   the exit behind a stuck writer).
+//   ArmExitWatchdog does nothing without async mode. Between PublishAsyncLocked and the one store
+//   of g_table, every logger still reads synchronous while the watchdog is already armable: a crash
+//   then is bounded too, and nothing on its path depends on the queue (LogUrgent logs plainly
+//   through a synchronous logger).
+// - A logger the switch replaced is never freed (g_retired) and stays synchronous: a thread that
+//   took its pointer just before the switch writes that one line to the sinks itself, within the
+//   bound like any synchronous crash line once armed. GetLoggerRaw reads the published table
+//   (g_table: g_raw before the switch, the replacement after), never g_registry.
 // - Every crash, fatal or abort entry arms it before its first ordinary log call (a line before the
 //   arm is urgent): REX_FATAL, REX_FATAL_CAT, REX_FATAL_FN, REX_FATAL_IF and REX_ASSERT in a debug
 //   build (logging/assert.h), the portal's OnCrash and OnAbort (dev/write_watch.cpp), WriteOnWriter
@@ -324,15 +408,18 @@ LogConfig g_config;
 //   can still wait on a full queue behind a stuck writer: OnClosing's TerminateTitle (its debug line
 //   in kernel_state.cpp) and the lines of EndServer's session drain (the audit's retained
 //   exclusions). Bounded by arming it: HalReturnToFirmware (the title's shutdown: an urgent line, the
-//   arm, FlushLogging, then exit(0), whose static teardown joins the log writer). Not S: the
-//   portal's export runs (one ordinary line on the launcher's synchronous loggers, FlushLogging,
-//   _Exit).
+//   arm, FlushLogging, then exit(0), whose static teardown joins the log writer). A client after its
+//   switch has the same exit paths (the same executable; the S-only EndServer aside) and the same
+//   retained exclusion (OnClosing's TerminateTitle line). Never in async mode: the portal's export
+//   runs (one ordinary line on the launcher's synchronous loggers, FlushLogging, _Exit); they quit
+//   without a session, so no switch can precede them.
 // - Every wait on an armed path is best effort under the watchdog's deadline (CapToExit): an urgent
 //   line's room wait, FlushLogging, DrainQueue. Delivery to the sinks is never the bound.
 // - The watchdog thread takes no lock, allocates nothing and logs nothing.
 //
-// The queue and its one writer thread; set by the first InitLogging when log_async is on, null
-// otherwise (then every logger is the plain synchronous spdlog::logger, as before). g_pool_raw
+// The queue and its one writer thread; set by PublishAsyncLocked (the first InitLogging when
+// log_async is on, or EnableAsyncLogging), null otherwise (then every logger is the plain synchronous
+// spdlog::logger, as before). g_pool_raw
 // (defined with the slow-write witness above) is the same pool for NoteSinkCall, which runs on any
 // thread without g_mutex.
 // Changed under g_mutex and g_pool_mutex; LogUrgent copies it under g_pool_mutex alone (held only
@@ -376,21 +463,27 @@ std::timed_mutex g_urgent_mutex;
 // watchdog fires however its waits add up (three urgent lines' room waits, a drain that succeeds
 // late, a concurrent FlushLogging holding g_mutex: Sol's narrow round B round 3); the watchdog only
 // ends one stuck in direct sink I/O or anything else unbounded. Its thread is started before the pool
-// (InitLogging; the invariant above) and touches only atomics, a sleep and TerminateProcess/_Exit:
-// no log lock, no allocation, no loader lock. Synchronous logging (log_async off, the other games,
-// offline play, and a process whose watchdog did not start) has no pool, so ArmExitWatchdog does
-// nothing there and crashes behave as before.
+// (MakeAsyncLocked; the invariant above) and touches only atomics, a sleep and
+// TerminateProcess/_Exit: no log lock, no allocation, no loader lock. Synchronous logging (log_async
+// off and no switch: the other games, offline play before any session, and a process whose
+// watchdog did not start) has no pool and no watchdog thread, so ArmExitWatchdog does nothing there
+// and crashes behave as before.
 constexpr std::chrono::milliseconds kExitBound{4000};
 constexpr int kExitWatchdogCode = 3;  // std::abort's exit code on Windows
 std::atomic<int64_t> g_exit_deadline{0};  // steady_clock ticks of the deadline; 0 = not armed
 std::atomic<void (*)()> g_exit_hook{nullptr};  // unit tests only (SetExitWatchdogHookForTesting)
+std::atomic<void (*)()> g_switch_hook{nullptr};  // unit tests only (SetSwitchPublishHookForTesting)
 std::atomic<bool> g_exit_watchdog_running{false};
-// Async mode is in effect, so ArmExitWatchdog arms: set by InitLogging once the watchdog runs and
-// the pool exists, before any logger is asynchronous; cleared by ShutdownLogging only after the pool
+// Async mode is in effect, so ArmExitWatchdog arms: set by PublishAsyncLocked (InitLogging or
+// EnableAsyncLogging) once the watchdog runs and the pool exists, before any logger is
+// asynchronous; cleared by ShutdownLogging only after the pool
 // is gone (never when a stuck writer's pool is left to the exit). The invariant's "never stopped
 // while a pool exists".
 std::atomic<bool> g_exit_watchdog_live{false};
-// The watchdog failed to start: log_async counts as off for the rest of the process (InitLogging).
+// The watchdog failed to start, or the pool (MakeAsyncLocked) or a switch's asynchronous loggers
+// (EnableAsyncLogging) could not be made: async mode is refused for the rest of the process, at
+// InitLogging and at every later EnableAsyncLogging (unit tests clear it:
+// SetExitWatchdogStartFailureForTesting).
 std::atomic<bool> g_log_async_refused{false};
 std::atomic<bool> g_exit_watchdog_fail_for_testing{false};  // SetExitWatchdogStartFailureForTesting
 // How long before the watchdog's deadline every bounded wait of an armed path ends: room for the
@@ -439,8 +532,8 @@ void ExitWatchdogMain() {
   }
 }
 
-// Starts the watchdog's thread once per process (InitLogging with log_async, under g_mutex, before
-// the pool). False if the thread could not be started (or a unit test injects that failure).
+// Starts the watchdog's thread once per process (MakeAsyncLocked, under g_mutex, before the
+// pool). False if the thread could not be started (or a unit test injects that failure).
 bool StartExitWatchdog() {
   if (g_exit_watchdog_fail_for_testing.load(std::memory_order_acquire))
     return false;
@@ -505,6 +598,87 @@ class DrainMarkSink final : public spdlog::sinks::base_sink<spdlog::details::nul
 std::shared_ptr<DrainMarkSink> g_mark_sink;      // per pool
 std::shared_ptr<spdlog::async_logger> g_mark_logger;
 uint64_t g_mark_seq = 0;  // per pool, under g_mutex: the last mark posted
+
+// What MakeAsyncLocked (or StartAsyncLocked, or EnableAsyncLogging) did.
+enum class AsyncStart { kStarted, kNoWatchdog, kNoQueue, kNoLoggers };
+
+// Async mode's parts, made but not yet published (MakeAsyncLocked, then PublishAsyncLocked).
+struct AsyncParts {
+  std::shared_ptr<spdlog::details::thread_pool> pool;
+  std::shared_ptr<DrainMarkSink> mark_sink;
+  std::shared_ptr<spdlog::async_logger> mark_logger;
+};
+
+// The first half of async mode's one start sequence, for both entries (InitLogging with log_async,
+// and EnableAsyncLogging at a client's first online session), so the invariant's order exists in
+// one place: the exit watchdog's thread first, then the pool and the drain mark, made but not
+// published (kStarted). On a failure nothing is published (no pool, nothing armable, no logger
+// changed) and async mode is refused for the rest of the process (g_log_async_refused): the
+// watchdog's thread could not start (kNoWatchdog), or the queue (log_async_queue lines, about 13 MB
+// by default) or its writer thread could not be made (kNoQueue; not worth a retry). Before
+// 2026-11-07 a throwing pool construction escaped InitLogging; it is caught now. A pool made here
+// and never published is destroyed with `parts` (its idle writer is joined); the watchdog's thread
+// then stays parked, never armed. Caller holds g_mutex, and g_pool is null.
+AsyncStart MakeAsyncLocked(AsyncParts& parts) {
+  if (!StartExitWatchdog()) {
+    g_log_async_refused.store(true, std::memory_order_release);
+    return AsyncStart::kNoWatchdog;
+  }
+  const size_t queue = static_cast<size_t>(std::max<int32_t>(1024, REXCVAR_GET(log_async_queue)));
+  try {
+    parts.pool =
+        std::make_shared<spdlog::details::thread_pool>(queue, 1, [] { t_log_writer = true; });
+    parts.mark_sink = std::make_shared<DrainMarkSink>();
+    parts.mark_logger = std::make_shared<spdlog::async_logger>(
+        "rex.log.drain", parts.mark_sink, parts.pool, spdlog::async_overflow_policy::discard_new);
+    parts.mark_logger->set_level(spdlog::level::trace);
+    parts.mark_logger->flush_on(spdlog::level::off);
+  } catch (...) {
+    parts = {};
+    g_log_async_refused.store(true, std::memory_order_release);
+    return AsyncStart::kNoQueue;
+  }
+  return AsyncStart::kStarted;
+}
+
+// The second half: publishes what MakeAsyncLocked made, the pool first, then armable, then the
+// drain mark. Cannot throw (moves and atomic stores). Caller holds g_mutex, not g_level_mutex.
+void PublishAsyncLocked(AsyncParts& parts) noexcept {
+  {
+    std::lock_guard pool_lock(g_pool_mutex);
+    g_pool = std::move(parts.pool);
+  }
+  // Armable from here (the watchdog runs; no logger is asynchronous yet, so nothing can have needed
+  // it before).
+  g_exit_watchdog_live.store(true, std::memory_order_release);
+  g_pool_raw.store(g_pool.get(), std::memory_order_release);
+  g_writer_stuck.store(false, std::memory_order_release);
+  g_urgent_no_room.store(false, std::memory_order_release);
+  g_mark_seq = 0;
+  g_mark_sink = std::move(parts.mark_sink);
+  g_mark_logger = std::move(parts.mark_logger);
+}
+
+// Both halves at once, for InitLogging (its rebuild then makes the loggers asynchronous). Caller
+// holds g_mutex, and g_pool is null.
+AsyncStart StartAsyncLocked() {
+  AsyncParts parts;
+  const AsyncStart start = MakeAsyncLocked(parts);
+  if (start == AsyncStart::kStarted)
+    PublishAsyncLocked(parts);
+  return start;
+}
+
+// The warning of a refused start, logged after g_mutex is released (the loggers are synchronous
+// then, so it goes straight to the sinks).
+void WarnAsyncRefused(AsyncStart start) {
+  if (start == AsyncStart::kNoWatchdog)
+    REXLOG_WARN("Log: the exit watchdog did not start; logging stays synchronous");
+  else if (start == AsyncStart::kNoQueue)
+    REXLOG_WARN("Log: the log queue could not be made; logging stays synchronous");
+  else if (start == AsyncStart::kNoLoggers)
+    REXLOG_WARN("Log: the asynchronous loggers could not be made; logging stays synchronous");
+}
 
 // Every logger's sinks, each once. Caller holds g_mutex.
 std::vector<spdlog::sink_ptr> DistinctSinks() {
@@ -667,8 +841,9 @@ spdlog::level::level_enum ResolveCategoryLevel(const std::string& name) {
 // Create a logger and register it
 std::shared_ptr<spdlog::logger> CreateCategoryLogger(const std::string& name) {
   auto sinks = BuildCategorySinks(name);
-  // log_async: the late loggers queue to the writer (block policy: a full queue makes the caller
-  // wait rather than drop a line). The early loggers (InitLoggingEarly) stay synchronous.
+  // Async mode: the late loggers queue to the writer (block policy: a full queue makes the caller
+  // wait rather than drop a line), also a category registered after EnableAsyncLogging. The early
+  // loggers (InitLoggingEarly) stay synchronous.
   std::shared_ptr<spdlog::logger> logger;
   if (g_pool)
     logger = std::make_shared<spdlog::async_logger>(name, sinks.begin(), sinks.end(), g_pool,
@@ -713,9 +888,10 @@ void InitLoggingEarly() {
   g_config.default_level = kDefaultLogLevel;
 
   // Create loggers for any categories already registered during static init
-  for (auto& entry : g_registry) {
+  for (size_t i = 0; i < g_registry.size(); ++i) {
+    auto& entry = g_registry[i];
     if (!entry.name.empty() && !entry.logger)
-      entry.logger = CreateCategoryLogger(entry.name);
+      SetEntryLogger(i, CreateCategoryLogger(entry.name));
   }
 
   // Set default logger to "core" if registered
@@ -733,6 +909,7 @@ void InitLogging(const LogConfig& config) {
 
   if (g_initialized) {
     g_config = config;
+    std::lock_guard level_lock(g_level_mutex);  // set_level, flush_on: no sink call
     for (auto& entry : g_registry) {
       if (!entry.logger)
         continue;
@@ -793,48 +970,30 @@ void InitLogging(const LogConfig& config) {
 
   // log_async: one writer thread, so the lines of all threads keep one order; stamps and thread ids
   // are taken at the call. The pool is this module's own (not spdlog's global one), so nothing else
-  // in the process can replace it under the loggers. The exit watchdog first (the invariant at the
-  // top of the async section): before the pool and before any logger turns asynchronous, and before
-  // any crash can need it (a thread started in a crash handler could fail or take the loader lock).
-  // If it cannot start, log_async counts as off for the process: no pool, synchronous loggers, and
-  // one warning through them (below).
-  bool watchdog_failed = false;
-  bool async = REXCVAR_GET(log_async) && !g_pool && !g_log_async_refused.load(std::memory_order_acquire);
-  if (async && !StartExitWatchdog()) {
-    g_log_async_refused.store(true, std::memory_order_release);
-    watchdog_failed = true;
-    async = false;
-  }
-  if (async) {
-    const size_t queue = static_cast<size_t>(std::max<int32_t>(1024, REXCVAR_GET(log_async_queue)));
-    {
-      std::lock_guard pool_lock(g_pool_mutex);
-      g_pool = std::make_shared<spdlog::details::thread_pool>(queue, 1, [] { t_log_writer = true; });
-    }
-    // Armable from here (the watchdog runs; no logger is asynchronous yet, so nothing can have
-    // needed it before). After the pool's creation, which can throw: then nothing is armable.
-    g_exit_watchdog_live.store(true, std::memory_order_release);
-    g_pool_raw.store(g_pool.get(), std::memory_order_release);
-    g_writer_stuck.store(false, std::memory_order_release);
-    g_urgent_no_room.store(false, std::memory_order_release);
-    g_mark_sink = std::make_shared<DrainMarkSink>();
-    g_mark_seq = 0;
-    g_mark_logger = std::make_shared<spdlog::async_logger>(
-        "rex.log.drain", g_mark_sink, g_pool, spdlog::async_overflow_policy::discard_new);
-    g_mark_logger->set_level(spdlog::level::trace);
-    g_mark_logger->flush_on(spdlog::level::off);
-  }
+  // in the process can replace it under the loggers. StartAsyncLocked starts the exit watchdog first
+  // (the invariant at the top of the async section): before the pool and before any logger turns
+  // asynchronous, and before any crash can need it (a thread started in a crash handler could fail
+  // or take the loader lock). If it cannot start, or the pool cannot be made, async mode is refused
+  // for the process: no pool, synchronous loggers, and one warning through them (below).
+  AsyncStart async_start = AsyncStart::kStarted;
+  if (REXCVAR_GET(log_async) && !g_pool && !g_log_async_refused.load(std::memory_order_acquire))
+    async_start = StartAsyncLocked();
 
-  // Rebuild all loggers with new sinks
-  for (auto& entry : g_registry) {
+  // Rebuild all loggers with new sinks (asynchronous ones when the pool was just made)
+  for (size_t i = 0; i < g_registry.size(); ++i) {
+    auto& entry = g_registry[i];
     if (entry.name.empty())
       continue;
     if (entry.logger)
       spdlog::drop(entry.name);
-    entry.logger = CreateCategoryLogger(entry.name);
+    std::shared_ptr<spdlog::logger> logger = CreateCategoryLogger(entry.name);
+    std::lock_guard level_lock(g_level_mutex);
+    SetEntryLoggerLocked(i, std::move(logger));
     if (g_config.category_levels.count(entry.name))
       entry.has_explicit_level = true;
   }
+  if (g_pool)
+    g_loggers_async.store(true, std::memory_order_release);
 
   // Set default logger to "core"
   for (auto& entry : g_registry) {
@@ -856,9 +1015,7 @@ void InitLogging(const LogConfig& config) {
   lock.unlock();
   if (async_queue)
     REXLOG_INFO("Log: asynchronous, queue {} lines, one writer", async_queue);
-  // The loggers are synchronous here (no pool), so the warning goes straight to the sinks.
-  if (watchdog_failed)
-    REXLOG_WARN("Log: the exit watchdog did not start; logging stays synchronous");
+  WarnAsyncRefused(async_start);
 }
 
 void InitLogging(const char* log_file, spdlog::level::level_enum level) {
@@ -866,6 +1023,136 @@ void InitLogging(const char* log_file, spdlog::level::level_enum level) {
   config.log_file = log_file;
   config.default_level = level;
   InitLogging(config);
+}
+
+// The run-time entry into async mode (the owner's decision of 2026-11-07 after P1n, run
+// 20261107-014744-log-stall: "1 but only online"; docs/online-1B.md amendment an). A client's
+// synchronous file sink stalled 24 s on a disk stall, its network pump waited on it to log one line,
+// and the client dropped the session; S, asynchronous from InitLogging, stayed up. Offline play
+// before any session must stay exactly as it is, so log_async stays off for clients and the game
+// calls this once its first session starts. One-way: it never switches back (that would join the
+// writer, which can hang behind a stuck sink, and would need a drain producers cannot overtake).
+//
+// Design A of the review: every category gets a new async_logger with the old one's sinks, level
+// and flush level, published to g_raw (release); the synchronous loggers it replaces go to
+// g_retired and are never freed, so a pointer taken before the swap stays valid and logs
+// synchronously (spdlog's async_logger is final and gets its pool only in its constructor, so a
+// logger cannot become asynchronous in place). Never spdlog::drop, which resets spdlog's default
+// logger when the name is "core" while a concurrent spdlog::error may read it, and never
+// set_default_logger (not safe against default_logger_raw): the default logger stays the old "core"
+// logger, alive in g_retired. spdlog's own map is not touched either (since the review of
+// 2026-11-07; no register_or_replace): that takes spdlog's map lock, which spdlog's periodic flush
+// (flush_every, log_flush_interval > 0) holds while it flushes the synchronous loggers, so in a
+// disk stall the switch would wait on a sink. Nothing in the SDK, the portal or the game reads that
+// map (no spdlog::get or apply_all); it keeps the retired loggers, through which a periodic flush
+// still flushes the same sinks on spdlog's own thread, as before the switch.
+//
+// The order (the review of 2026-11-07): the watchdog, the pool and the mark are made
+// (MakeAsyncLocked), then every asynchronous logger is built on that unpublished pool, and only
+// when all exist is anything published: the pool and armable (PublishAsyncLocked), then, under
+// g_level_mutex, a replacement table (a copy of the current one holding every asynchronous logger,
+// the level copied there, so a concurrent level change is never lost) published with one release
+// store of g_table. A failure anywhere before the publish (watchdog, queue, a logger out
+// of memory) changes nothing, refuses async mode for the process and logs one warning through the
+// synchronous loggers.
+//
+// It never calls a sink and never waits for one: g_mutex is taken with a 3 s deadline (a
+// synchronous FlushLogging stuck in a sink holds it), g_level_mutex is never held across a sink
+// call, and its one line is queued after the locks are released. The exception: a refused start's
+// warning goes through the synchronous loggers, as at InitLogging. Order: the lines of one thread
+// to one category keep their order across the switch (a line that took the old pointer is written
+// before its call returns; the slot never goes back). Across categories a thread's lines keep their
+// order too: every category switches at the same instant (the one store of g_table), so no line is
+// queued through a switched category while a later one is written through a category that is not
+// switched yet (unit tests U1b and U1c).
+bool EnableAsyncLogging() {
+  if (g_loggers_async.load(std::memory_order_acquire))
+    return true;
+  // Never on the writer (it exists only in async mode) and never after a refused start.
+  if (t_log_writer || g_log_async_refused.load(std::memory_order_acquire))
+    return false;
+  std::unique_lock lock(g_mutex, Clock::now() + kDrainBound);
+  if (!lock.owns_lock())
+    return false;  // no mark: a later call (the next session) tries again
+  if (g_loggers_async.load(std::memory_order_acquire))
+    return true;
+  if (!g_initialized || g_pool || g_log_async_refused.load(std::memory_order_acquire))
+    return false;
+  // Room for the replaced loggers first, so the swaps below cannot fail on it.
+  try {
+    if (!g_retired)
+      g_retired = new std::vector<std::shared_ptr<spdlog::logger>>();
+    g_retired->reserve(g_retired->size() + g_registry.size());
+  } catch (...) {
+    return false;
+  }
+  AsyncParts parts;
+  AsyncStart start = MakeAsyncLocked(parts);
+  struct Swap {
+    size_t id;
+    std::shared_ptr<spdlog::logger> old;
+    std::shared_ptr<spdlog::logger> async;
+  };
+  std::vector<Swap> swaps;
+  LoggerTable* next = nullptr;  // the replacement table, published once below
+  if (start == AsyncStart::kStarted) {
+    try {
+      next = new LoggerTable();  // zero-initialized slots
+      swaps.reserve(g_registry.size());
+      // g_registry's loggers and their sink lists change only under g_mutex, which is held.
+      for (size_t id = 0; id < g_registry.size(); ++id) {
+        std::shared_ptr<spdlog::logger> old = g_registry[id].logger;
+        if (!old)
+          continue;
+        // The sinks as the old logger has them now: a category's own AddSink, the capture ring, a
+        // test's stall sink and a replaced console sink all come along. No existing sink list is
+        // changed. Level and flush level are copied at the publish below.
+        auto async = std::make_shared<spdlog::async_logger>(old->name(), old->sinks().begin(),
+                                                            old->sinks().end(), parts.pool,
+                                                            spdlog::async_overflow_policy::block);
+        swaps.push_back(Swap{id, std::move(old), std::move(async)});
+      }
+    } catch (...) {
+      // Out of memory: nothing was published. Refused for the process, like a failed queue.
+      g_log_async_refused.store(true, std::memory_order_release);
+      start = AsyncStart::kNoLoggers;
+    }
+  }
+  if (start != AsyncStart::kStarted) {
+    delete next;    // never published, so no reader can hold it
+    swaps.clear();  // never published
+    parts = {};     // a made pool is destroyed here (its idle writer is joined)
+    lock.unlock();
+    WarnAsyncRefused(start);
+    return false;
+  }
+  PublishAsyncLocked(parts);
+  {
+    // The swaps (nothing here allocates or throws: g_retired was reserved above). The new table
+    // starts as a copy of the current one (writers hold g_mutex, which is held here, so it cannot
+    // change under the copy), takes every async logger, and is then published with ONE release
+    // store: GetLoggerRaw sees every category switch at the same instant (see g_table).
+    std::lock_guard level_lock(g_level_mutex);
+    LoggerTable* current = g_table.load(std::memory_order_relaxed);
+    for (size_t id = 0; id < g_registry.size(); ++id)
+      (*next)[id].store((*current)[id].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    for (Swap& swap : swaps) {
+      swap.async->set_level(swap.old->level());  // the level now (a log_level change is kept)
+      swap.async->flush_on(swap.old->flush_level());
+      (*next)[swap.id].store(swap.async.get(), std::memory_order_relaxed);
+      g_retired->push_back(std::move(swap.old));
+      g_registry[swap.id].logger = std::move(swap.async);
+    }
+    if (void (*hook)() = g_switch_hook.load(std::memory_order_acquire))
+      hook();  // unit tests: every category must still read synchronous here
+    g_table.store(next, std::memory_order_release);
+  }
+  g_loggers_async.store(true, std::memory_order_release);
+  const size_t queue = static_cast<size_t>(std::max<int32_t>(1024, REXCVAR_GET(log_async_queue)));
+  lock.unlock();
+  // Marks the switch in the log (another thread's line can be queued just before it).
+  REXLOG_INFO("Log: asynchronous from now on, queue {} lines, one writer", queue);
+  return true;
 }
 
 void ShutdownLogging() {
@@ -886,7 +1173,19 @@ void ShutdownLogging() {
   }
 
   spdlog::shutdown();
-  g_registry.clear();
+  std::vector<LogCategoryEntry> registry;
+  {
+    std::lock_guard level_lock(g_level_mutex);
+    LoggerTable* table = g_table.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < g_registry.size(); ++i) {
+      (*table)[i].store(nullptr, std::memory_order_release);
+      g_raw[i].store(nullptr, std::memory_order_release);
+    }
+    g_table.store(&g_raw, std::memory_order_release);  // a switched table is kept, never freed
+    registry.swap(g_registry);
+  }
+  g_loggers_async.store(false, std::memory_order_release);
+  registry.clear();  // the loggers are freed outside the level lock
   g_console_sink.reset();
   g_file_sink.reset();
   g_early_sink.reset();
@@ -1036,6 +1335,30 @@ void ArmExitWatchdog() {
     g_exit_deadline.notify_one();
 }
 
+void SetSwitchPublishHookForTesting(void (*hook)()) {
+  g_switch_hook.store(hook, std::memory_order_release);
+}
+
+// Only from inside the publish hook (EnableAsyncLogging's thread holds g_mutex and g_level_mutex
+// there, so g_registry cannot change and no lock is taken here), or from a test thread when nothing
+// else logs or registers.
+void LoggerModeCountsForTesting(size_t& sync, size_t& async) {
+  sync = 0;
+  async = 0;
+  LoggerTable* table = g_table.load(std::memory_order_acquire);
+  for (size_t id = 0; id < g_registry.size(); ++id) {
+    if (!g_registry[id].logger)
+      continue;
+    spdlog::logger* logger = (*table)[id].load(std::memory_order_acquire);
+    if (!logger)
+      continue;
+    if (dynamic_cast<spdlog::async_logger*>(logger))
+      ++async;
+    else
+      ++sync;
+  }
+}
+
 void SetExitWatchdogHookForTesting(void (*hook)()) {
   g_exit_hook.store(hook, std::memory_order_release);
   g_exit_deadline.store(0, std::memory_order_release);
@@ -1049,6 +1372,10 @@ void SetExitWatchdogStartFailureForTesting(bool fail) {
 bool LogAsyncActive() {
   std::lock_guard pool_lock(g_pool_mutex);
   return g_pool != nullptr;
+}
+
+bool ExitWatchdogArmedForTesting() {
+  return g_exit_deadline.load(std::memory_order_acquire) != 0;
 }
 
 void UrgentLogCounts(size_t& missed_sink, size_t& displaced) {
@@ -1089,10 +1416,13 @@ LogCategoryId RegisterLogCategory(const char* name) {
   uint16_t id = static_cast<uint16_t>(g_registry.size());
   LogCategoryEntry entry;
   entry.name = name;
-  if (g_initialized || g_early_initialized) {
-    entry.logger = CreateCategoryLogger(name);
-  }
+  std::shared_ptr<spdlog::logger> logger;
+  if (g_initialized || g_early_initialized)
+    logger = CreateCategoryLogger(name);
+  std::lock_guard level_lock(g_level_mutex);  // a push_back may move g_registry
   g_registry.push_back(std::move(entry));
+  if (logger)
+    SetEntryLoggerLocked(id, std::move(logger));
   return LogCategoryId{id};
 }
 
@@ -1113,12 +1443,16 @@ LogCategoryId RegisterLogSubcategory(const char* name, LogCategoryId parent) {
   LogCategoryEntry entry;
   entry.name = full_name;
   entry.parent = parent;
+  std::shared_ptr<spdlog::logger> logger;
   if (g_initialized || g_early_initialized) {
-    entry.logger = CreateCategoryLogger(full_name);
+    logger = CreateCategoryLogger(full_name);
     if (g_config.category_levels.count(full_name))
       entry.has_explicit_level = true;
   }
+  std::lock_guard level_lock(g_level_mutex);  // a push_back may move g_registry
   g_registry.push_back(std::move(entry));
+  if (logger)
+    SetEntryLoggerLocked(id, std::move(logger));
   return LogCategoryId{id};
 }
 
@@ -1137,18 +1471,22 @@ std::span<const LogCategoryEntry> GetAllCategories() {
   return {g_registry.data(), g_registry.size()};
 }
 
+// The macros' fast path, on any thread without a lock: one acquire load from g_raw (see there), the
+// same pointer g_registry holds. The pointer stays valid for the process even if
+// EnableAsyncLogging replaces the category's logger right after (g_retired); only ShutdownLogging
+// (unit tests) frees loggers.
 spdlog::logger* GetLoggerRaw(LogCategoryId category) {
   if (!g_initialized && !g_early_initialized)
     InitLoggingEarly();
-  if (category.id < g_registry.size()) {
-    return g_registry[category.id].logger.get();
-  }
-  return nullptr;
+  return (*g_table.load(std::memory_order_acquire))[category.id].load(std::memory_order_acquire);
 }
 
+// Under g_level_mutex (since 2026-11-07): EnableAsyncLogging may assign the entry on another
+// thread. Not g_mutex, which a synchronous FlushLogging holds across its sink flush.
 std::shared_ptr<spdlog::logger> GetLogger(LogCategoryId category) {
   if (!g_initialized && !g_early_initialized)
     InitLoggingEarly();
+  std::lock_guard lock(g_level_mutex);
   if (category.id < g_registry.size()) {
     return g_registry[category.id].logger;
   }
@@ -1159,7 +1497,14 @@ std::shared_ptr<spdlog::logger> GetLogger() {
   return GetLogger(rex::log::core());
 }
 
-void SetCategoryLevel(LogCategoryId category, spdlog::level::level_enum level) {
+namespace {
+
+// The level setters' bodies; caller holds g_level_mutex. The public ones and the log_level callback
+// take it (since 2026-11-07), because EnableAsyncLogging copies each logger's level and replaces the
+// logger under it: Host runs the switch on its own thread while the UI thread may change levels.
+// Only g_level_mutex, never g_mutex, so a setter never waits on a sink (the review of 2026-11-07);
+// the mutex is not recursive, hence the split.
+void SetCategoryLevelLocked(LogCategoryId category, spdlog::level::level_enum level) {
   if (category.id < g_registry.size()) {
     if (auto& logger = g_registry[category.id].logger) {
       logger->set_level(level);
@@ -1167,15 +1512,8 @@ void SetCategoryLevel(LogCategoryId category, spdlog::level::level_enum level) {
   }
 }
 
-void SetAllLevels(spdlog::level::level_enum level) {
-  for (auto& entry : g_registry) {
-    if (entry.logger)
-      entry.logger->set_level(level);
-  }
-}
-
-void SetRootLevel(LogCategoryId root, spdlog::level::level_enum level) {
-  SetCategoryLevel(root, level);
+void SetRootLevelLocked(LogCategoryId root, spdlog::level::level_enum level) {
+  SetCategoryLevelLocked(root, level);
   for (auto& entry : g_registry) {
     if (entry.parent.has_value() && entry.parent->id == root.id && !entry.has_explicit_level &&
         entry.logger)
@@ -1183,13 +1521,35 @@ void SetRootLevel(LogCategoryId root, spdlog::level::level_enum level) {
   }
 }
 
+}  // namespace
+
+void SetCategoryLevel(LogCategoryId category, spdlog::level::level_enum level) {
+  std::lock_guard lock(g_level_mutex);
+  SetCategoryLevelLocked(category, level);
+}
+
+void SetAllLevels(spdlog::level::level_enum level) {
+  std::lock_guard lock(g_level_mutex);
+  for (auto& entry : g_registry) {
+    if (entry.logger)
+      entry.logger->set_level(level);
+  }
+}
+
+void SetRootLevel(LogCategoryId root, spdlog::level::level_enum level) {
+  std::lock_guard lock(g_level_mutex);
+  SetRootLevelLocked(root, level);
+}
+
 void RegisterLogLevelCallback() {
   rex::cvar::RegisterChangeCallback("log_level", [](std::string_view, std::string_view value) {
     if (auto level = ParseLogLevel(std::string(value))) {
+      // Under the cvar registry's lock: g_level_mutex only, held for set_level calls alone.
+      std::lock_guard lock(g_level_mutex);
       for (size_t i = 0; i < g_registry.size(); ++i) {
         auto& entry = g_registry[i];
         if (!entry.parent.has_value() && entry.logger && !entry.has_explicit_level)
-          SetRootLevel(LogCategoryId{static_cast<uint16_t>(i)}, *level);
+          SetRootLevelLocked(LogCategoryId{static_cast<uint16_t>(i)}, *level);
       }
     }
   });
@@ -1198,6 +1558,8 @@ void RegisterLogLevelCallback() {
 // AddSink, RemoveSink and ReplaceConsoleSink change the loggers' sink lists, which the log_async
 // writer reads without a lock: they run only before other threads log (ReXApp after InitLogging,
 // OnPostInitLogging), as before. With log_async they first let the writer finish what is queued.
+// EnableAsyncLogging copies the sink lists they made into the new loggers (a sink added after a
+// switch would not reach the retired synchronous loggers; nothing adds one that late).
 void AddSink(spdlog::sink_ptr given) {
   std::lock_guard lock(g_mutex);
   DrainQueue(Clock::now() + kDrainBound, false);

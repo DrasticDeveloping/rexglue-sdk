@@ -113,11 +113,11 @@ void LogUrgent(LogCategoryId category, spdlog::level::level_enum level, std::str
  * and FlushLogging share that budget: each ends 150 ms before the deadline at the latest
  * (a thread's first FlushLogging 250 ms earlier still, for the abort handler's after it),
  * so the watchdog only ends a path stuck in a sink. The first call sets the deadline;
- * later calls keep it. Does nothing with synchronous logging (no pool): log_async off,
- * or a process whose watchdog could not start (InitLogging starts the watchdog before
- * the pool; if it cannot, log_async counts as off for the process, the loggers stay
- * synchronous and it logs `Log: the exit watchdog did not start; logging stays
- * synchronous`).
+ * later calls keep it. Does nothing with synchronous logging (no pool): log_async off
+ * and no EnableAsyncLogging (offline play), or a process whose watchdog could not start
+ * (InitLogging and EnableAsyncLogging start the watchdog before the pool; if it cannot,
+ * async mode is refused for the process, the loggers stay synchronous and it logs
+ * `Log: the exit watchdog did not start; logging stays synchronous`).
  */
 void ArmExitWatchdog();
 
@@ -128,17 +128,67 @@ void ArmExitWatchdog();
 void SetExitWatchdogHookForTesting(void (*hook)());
 
 /**
- * Unit tests only: with `fail`, the next InitLogging's watchdog start fails as if its
- * thread could not be created (log_async then counts as off). Every call also clears
- * an earlier failure's "off for the process", so a later InitLogging tries again.
+ * Unit tests only: a function EnableAsyncLogging calls at the last instant before it publishes
+ * its replacement logger table (with g_mutex and the level lock held: the hook may only call
+ * GetLoggerRaw and record what it sees). Null: none. Lets a test prove that no category is
+ * asynchronous before the one publication (Sol, narrow round on the switch, M1).
+ */
+void SetSwitchPublishHookForTesting(void (*hook)());
+
+/**
+ * Unit tests only, and only from inside the publish hook above (its thread already holds the locks
+ * this reads under, so it takes none): how many registered categories' current loggers are
+ * synchronous and how many asynchronous. The order test checks every category this way, not a
+ * sample (the root-cause analysis of the switch's order test, M1).
+ */
+void LoggerModeCountsForTesting(size_t& sync, size_t& async);
+
+/**
+ * Unit tests only: with `fail`, the next watchdog start (InitLogging with log_async, or
+ * EnableAsyncLogging) fails as if its thread could not be created (async mode is then
+ * refused). Every call also clears an earlier failure's "refused for the process", so a
+ * later InitLogging or EnableAsyncLogging tries again.
  */
 void SetExitWatchdogStartFailureForTesting(bool fail);
 
+/** Unit tests only: whether the exit watchdog is armed now (a deadline is set). */
+bool ExitWatchdogArmedForTesting();
+
 /**
- * Whether the loggers are asynchronous now: log_async was on at InitLogging and its
- * exit watchdog started, so the queue and its writer thread exist.
+ * Whether async mode is on: log_async was on at InitLogging, or EnableAsyncLogging
+ * switched, and the exit watchdog started, so the queue and its writer thread exist.
  */
 bool LogAsyncActive();
+
+/**
+ * Turns asynchronous logging on for the rest of the process, as log_async does at
+ * InitLogging (an online client at its first online session, so play before it keeps
+ * the synchronous loggers). One-way and idempotent: true when every category logger is
+ * asynchronous on return (switched now or earlier, or log_async at init); false when
+ * the loggers stay synchronous: before InitLogging; the exit watchdog could not start
+ * (logs `Log: the exit watchdog did not start; logging stays synchronous`), the queue
+ * could not be made (`Log: the log queue could not be made; logging stays synchronous`)
+ * or an asynchronous logger could not be made (`Log: the asynchronous loggers could not
+ * be made; logging stays synchronous`), after which every later call returns false at
+ * once; or the log lock stayed busy for 3 s (a synchronous FlushLogging stuck in a sink;
+ * a later call may try again). A refused switch changes no logger. A switch logs
+ * `Log: asynchronous from now on, queue <n> lines, one writer`, which marks it (another
+ * thread's line can be queued just before it).
+ *
+ * Any thread after InitLogging, except: a crash or signal handler, a log sink or
+ * formatter, the log writer thread. It never calls a sink and never waits for one (but
+ * for the refusal warning above, which the synchronous loggers write); it waits at most
+ * 3 s for the log lock. Every category logger is replaced by an asynchronous one with
+ * the same sinks, level and flush level; the synchronous loggers it replaces are never
+ * freed, so a pointer taken from GetLoggerRaw or GetLogger before the switch stays valid
+ * (and logs synchronously). Order: one thread's lines to one category keep their order
+ * across the switch; across categories too, except for lines logged during the swap
+ * itself (microseconds), where a line to a category not yet swapped can reach the sinks
+ * before an earlier, queued one. From the switch on, crash and fatal paths are bounded
+ * by the exit watchdog (ArmExitWatchdog). spdlog's own registry is left as it was (it
+ * keeps the replaced loggers; nothing here reads it).
+ */
+bool EnableAsyncLogging();
 
 /**
  * What LogUrgent could not deliver whole, since the start: `missed_sink`, lines a sink
@@ -196,7 +246,11 @@ std::span<const LogCategoryEntry> GetAllCategories();
  * Get the raw logger pointer for a category (zero overhead).
  *
  * This is the fast path used by logging macros. Returns nullptr if
- * the category is not yet initialized.
+ * the category is not yet initialized. Lock-free (one atomic load). A pointer
+ * taken from InitLogging on stays valid until ShutdownLogging, even after
+ * EnableAsyncLogging replaced the category's logger (fetch it again per call to
+ * follow the switch); one taken before InitLogging is freed by InitLogging's
+ * rebuild of the loggers.
  *
  * @param category  Category handle.
  * @return          Raw pointer to the spdlog logger (not owning).

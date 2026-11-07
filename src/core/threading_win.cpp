@@ -13,13 +13,22 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include "platform_win.h"
 
-#include <spdlog/spdlog.h>
+#include <rex/logging.h>
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
 
-#define LOG_LASTERROR() \
-  { spdlog::error("Win32 Error 0x{:08X} in {}(...)", GetLastError(), __FUNCTION__); }
+// Through the core category's logger (rex::GetLoggerRaw), not spdlog's default logger (2026-11-07):
+// rex::EnableAsyncLogging replaces the category loggers at run time but leaves spdlog's default
+// logger the old synchronous "core" one (it must not call set_default_logger or drop under a
+// concurrent spdlog::error), so after a switch this line would bypass the queue. Same text, same
+// level. GetLastError is read first: the macro's own work before the arguments (GetLoggerRaw,
+// rex::log::core()'s registration on first use, InitLoggingEarly) can overwrite the Win32 code.
+#define LOG_LASTERROR()                                                             \
+  {                                                                                 \
+    const DWORD rex_last_error_ = GetLastError();                                   \
+    REXLOG_ERROR("Win32 Error 0x{:08X} in {}(...)", rex_last_error_, __FUNCTION__); \
+  }
 
 typedef HANDLE (*SetThreadDescriptionFn)(HANDLE hThread, PCWSTR lpThreadDescription);
 
