@@ -510,7 +510,10 @@ void ReXApp::OnKeyDown(ui::KeyEvent& e) {
 
 void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
-  REXLOG_INFO("Window closing, shutting down...");
+  // Both lines here go through the urgent path (LogUrgent): with log_async an ordinary line waits
+  // without bound for room in a full queue behind a stuck log writer, and closing the window would
+  // never reach FlushLogging/_Exit. Synchronous logging: the same log call and text as before.
+  REXLOG_URGENT_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
@@ -519,7 +522,7 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   // lock still held by a straggler TerminateTitle left running. Flush (not
   // ShutdownLogging, which frees loggers a straggler may still use); the OS
   // reclaims the rest.
-  REXLOG_INFO("Title terminated; hard-exiting process.");
+  REXLOG_URGENT_INFO("Title terminated; hard-exiting process.");
   rex::FlushLogging();
   std::_Exit(0);
 }

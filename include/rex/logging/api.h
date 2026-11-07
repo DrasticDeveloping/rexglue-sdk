@@ -26,6 +26,8 @@ REXCVAR_DECLARE(std::string, log_file);
 REXCVAR_DECLARE(bool, log_verbose);
 REXCVAR_DECLARE(bool, log_noisy);
 REXCVAR_DECLARE(int32_t, log_flush_interval);
+REXCVAR_DECLARE(bool, log_async);
+REXCVAR_DECLARE(int32_t, log_async_queue);
 REXCVAR_DECLARE(int32_t, log_max_file_size_mb);
 REXCVAR_DECLARE(int32_t, log_max_files);
 
@@ -79,8 +81,83 @@ void ShutdownLogging();
  * Use before a hard process exit (std::_Exit) when other threads may still be
  * logging: unlike ShutdownLogging it leaves the registry and sinks intact, so a
  * concurrent logger cannot hit freed state.
+ *
+ * With log_async it waits until the writer thread has written every line queued
+ * before the call and flushed every sink after them, so the lines are on disk when
+ * it returns; at most 3 s from the call (250 ms once a drain found the writer
+ * stuck), and it never calls a sink itself. On the writer thread it returns at once.
  */
 void FlushLogging();
+
+/**
+ * Logs one line of a fatal error or a crash report (REX_FATAL*, REXLOG_URGENT_*).
+ *
+ * With synchronous loggers it is an ordinary log call. With log_async it never waits
+ * without bound for room in the queue (ordinary lines do, the block policy): it keeps
+ * trying to claim a free slot (atomically, under the queue's lock) for at most 500 ms
+ * (one try once a drain found the writer stuck), and only then pushes the oldest
+ * queued line out. On the writer thread itself (a crash inside a sink) it arms the
+ * exit watchdog (ArmExitWatchdog), then writes and flushes the line directly to every
+ * sink except the one the writer is inside. `loc` is the caller's source location
+ * (REXLOG_CAT_URGENT passes __FILE__, __LINE__, __FUNCTION__, as the ordinary macros
+ * do). Call FlushLogging after it before the process ends.
+ */
+void LogUrgent(LogCategoryId category, spdlog::level::level_enum level, std::string_view text,
+               spdlog::source_loc loc = {});
+
+/**
+ * Arms the exit watchdog: with log_async, the process ends (TerminateProcess on Windows,
+ * _Exit elsewhere, exit code 3) 4 s after the first call, whatever the log sinks or any
+ * other code still do then. For crash and fatal paths only (the REX_FATAL macros, crash
+ * handlers; LogUrgent on the log writer arms it itself). Once armed, LogUrgent's room wait
+ * and FlushLogging share that budget: each ends 150 ms before the deadline at the latest
+ * (a thread's first FlushLogging 250 ms earlier still, for the abort handler's after it),
+ * so the watchdog only ends a path stuck in a sink. The first call sets the deadline;
+ * later calls keep it. Does nothing with synchronous logging (no pool): log_async off,
+ * or a process whose watchdog could not start (InitLogging starts the watchdog before
+ * the pool; if it cannot, log_async counts as off for the process, the loggers stay
+ * synchronous and it logs `Log: the exit watchdog did not start; logging stays
+ * synchronous`).
+ */
+void ArmExitWatchdog();
+
+/**
+ * Unit tests only: what the exit watchdog runs at its deadline instead of ending the
+ * process (null: end it), and disarms it. After the hook ran, it can be armed again.
+ */
+void SetExitWatchdogHookForTesting(void (*hook)());
+
+/**
+ * Unit tests only: with `fail`, the next InitLogging's watchdog start fails as if its
+ * thread could not be created (log_async then counts as off). Every call also clears
+ * an earlier failure's "off for the process", so a later InitLogging tries again.
+ */
+void SetExitWatchdogStartFailureForTesting(bool fail);
+
+/**
+ * Whether the loggers are asynchronous now: log_async was on at InitLogging and its
+ * exit watchdog started, so the queue and its writer thread exist.
+ */
+bool LogAsyncActive();
+
+/**
+ * What LogUrgent could not deliver whole, since the start: `missed_sink`, lines a sink
+ * missed because the writer was inside it; `displaced`, queued lines an urgent line
+ * pushed out of a full queue (this log_async queue; 0 when logging is synchronous).
+ */
+void UrgentLogCounts(size_t& missed_sink, size_t& displaced);
+
+/**
+ * The slowest sink write or flush over 1000 ms since the last call, if any.
+ *
+ * Every sink is timed around its write and its flush (the redacting wrapper).
+ * Returns false when none took that long. Otherwise fills in the time, the sink
+ * ("debug", "console", "file", "capture" or "added" for a sink given to AddSink
+ * or LogConfig::extra_sinks), and how many lines the log_async queue held when
+ * that write ended, i.e. the backlog behind it (0 when logging is synchronous),
+ * and clears the record.
+ */
+bool TakeSlowLogWrite(uint32_t& ms, const char*& sink, size_t& queued);
 
 /**
  * Register a new log category at runtime.
@@ -167,6 +244,9 @@ void RegisterLogLevelCallback();
 
 /**
  * Add a sink to all current and future loggers.
+ *
+ * Call it only before other threads log (the loggers' sink lists are not locked
+ * against the log_async writer); with log_async it first waits for the queue.
  *
  * @param sink  Shared pointer to the spdlog sink.
  */

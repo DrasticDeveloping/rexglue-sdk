@@ -517,8 +517,13 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
 }
 
 void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
-  REXKRNL_ERROR("XamShowDirtyDiscErrorUI called! user_index={}", uint32_t(user_index));
-  REXKRNL_ERROR("This indicates a disc/file read error - check that all game files exist");
+  // A fatal exit (the exit invariant, core/logging.cpp's async section). The two opening lines are
+  // urgent (same text, kernel category): with log_async they never wait without bound for room in
+  // the queue, so the path stays bounded until the arm below, which waits for the dialog.
+  REXLOG_CAT_URGENT(::rex::log::krnl(), spdlog::level::err,
+                    "XamShowDirtyDiscErrorUI called! user_index={}", uint32_t(user_index));
+  REXLOG_CAT_URGENT(::rex::log::krnl(), spdlog::level::err,
+                    "This indicates a disc/file read error - check that all game files exist");
 
   const Runtime* emulator = REX_KERNEL_STATE()->emulator();
   ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
@@ -529,7 +534,13 @@ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
                              "likely caused by bad or unimplemented file IO calls.",
                              {"OK"}, 0),
         [](MessageBoxDialog*) -> X_RESULT { return X_ERROR_SUCCESS; }, 0);
-  } else {
+  }
+  // The exit watchdog is armed before the next ordinary line (with log_async the process then ends
+  // within 4 s even if a log sink hangs or exit()'s teardown waits on the log writer). After the
+  // dialog above, which waits for the player's OK, so the bound does not cut it short.
+  // Synchronous logging: the arm does nothing and the flush is a plain one.
+  ::rex::ArmExitWatchdog();
+  if (!imgui_drawer) {
     // No UI available - log prominently and pause to let user see the error
     REXKRNL_ERROR("===========================================");
     REXKRNL_ERROR("FATAL: Disc Read Error (no UI to display)");
@@ -537,6 +548,7 @@ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
     REXKRNL_ERROR("Missing files or bad mounts cause this error");
     REXKRNL_ERROR("===========================================");
   }
+  ::rex::FlushLogging();
   // This is death, and should never return.
   // TODO(benvanik): cleaner exit.
   exit(1);

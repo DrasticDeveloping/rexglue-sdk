@@ -144,6 +144,11 @@ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
 }
 
 void KeBugCheckEx_entry(u32 code, u32 param1, u32 param2, u32 param3, u32 param4) {
+  // The console's STOP: a crash entry (the breakpoint below reaches the crash filter), so the exit
+  // watchdog is armed before the line (the exit invariant, core/logging.cpp's async section). With
+  // log_async the process ends within 4 s, also under a debugger that continues past the break.
+  // Synchronous logging: does nothing.
+  ::rex::ArmExitWatchdog();
   REXKRNL_DEBUG("*** STOP: 0x{:08X} (0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X})", code, param1, param2,
                 param3, param4);
   fflush(stdout);

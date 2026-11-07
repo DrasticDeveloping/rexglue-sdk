@@ -30,7 +30,11 @@ void HalReturnToFirmware_entry(u32 routine) {
 
   // TODO(benvank): diediedie much more gracefully
   // Not sure how to blast back up the stack in LLVM without exceptions, though.
-  REXKRNL_ERROR("Game requested shutdown via HalReturnToFirmware");
+  // exit(0)'s static teardown joins the async log writer (log_async); armed, the watchdog bounds it
+  // to 4 s even with a stuck writer (logging.cpp's exit invariant). Unarmed (log_async off) as before.
+  REXLOG_CAT_URGENT(::rex::log::krnl(), spdlog::level::err, "Game requested shutdown via HalReturnToFirmware");
+  ::rex::ArmExitWatchdog();
+  ::rex::FlushLogging();
   exit(0);
 }
 
