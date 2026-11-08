@@ -31,6 +31,7 @@ set(REXSYSTEM_SOURCES
     # XAM services
     xam/app_manager.cpp
     xam/content_manager.cpp
+    xam/save_import.cpp
     xam/user_profile.cpp
 
     ppc_types.cpp
@@ -109,7 +110,7 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
 endif()
 
 if(WIN32)
-    target_link_libraries(rexruntime PRIVATE ws2_32)
+    target_link_libraries(rexruntime PRIVATE ws2_32 bcrypt)
     target_link_libraries(rexruntime PUBLIC dxgi dxguid)
     target_compile_definitions(rexruntime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
