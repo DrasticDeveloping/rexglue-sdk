@@ -19,6 +19,7 @@ add_executable(unit_tests
     system/guest_path_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
+    system/save_import_test.cpp
     input/input_assignment_test.cpp
     graphics/shader_constant_overrides_test.cpp
     graphics/edram_layout_test.cpp
