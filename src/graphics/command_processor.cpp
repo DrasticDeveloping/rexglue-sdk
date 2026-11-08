@@ -103,6 +103,38 @@ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
     .range(1, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Stage 1B (X9) of Swap Force Online: before the hidden server's draw skip (render_hidden_draw,
+// below; it acts in d3d12/command_processor.cpp) is trusted, a run with this on shows whether the game uses
+// memexport, occlusion or visibility queries, or resolve readbacks at all, and how much GPU work a
+// hidden game asks for. Off by default: the counting itself runs either way (a few increments per
+// draw on the command processor thread), and with it off nothing is logged and nothing changes.
+// Draws, memexport draws, copies and occlusion queries are counted by the D3D12 command processor
+// only (Vulkan logs once that the counters and the draw skip are D3D12-only).
+REXCVAR_DEFINE_BOOL(gpu_draw_counters, false, "GPU",
+                    "Log the GPU work the game asks for every 10 s (draws, memexport draws, "
+                    "copies, swaps, occlusion and visibility queries, resolve readbacks); draws, "
+                    "memexport draws, copies and occlusion queries are counted on D3D12 only")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Swap Force Online, stage 1B item 3 (docs/online-1B.md, "Draw skip"; plan 2.1): the dedicated
+// server is the game started hidden (window_hidden), and stage 1A measured it doing the whole
+// frame's GPU work for a picture nobody sees. With this off and the window hidden, the D3D12
+// command processor's IssueDraw skips draws that do not memexport, IssueCopy skips the resolve,
+// IssueSwap keeps only its frame bookkeeping (no present), and occlusion queries get the fixed
+// fake sample count; packets, registers, fences, interrupts and the guest frame count go on as
+// before (rex/graphics/draw_skip.h). Found by reading d3d12/command_processor.cpp's IssueDraw/
+// IssueCopy/IssueSwap and this file's packet handlers: what each skipped part writes, and that
+// none of it reaches guest memory while resolve readback is off (the skip is refused when it is on
+// at startup). Safe because the default (on) draws exactly as before, a visible window ignores it,
+// and the server gets it only after the A/B safety case (P3) found no difference in the game's
+// events. Defined here, not next to the D3D12 code that acts on it, because the D3D12 backend is
+// not built everywhere and the Vulkan backend names it in its once-only "D3D12 only" notice.
+REXCVAR_DEFINE_BOOL(render_hidden_draw, true, "GPU",
+                    "With the window hidden (window_hidden), still draw. Off: a hidden game skips "
+                    "the GPU work nobody sees (draws without memory export, resolves, presents); "
+                    "D3D12 only")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "Compile shaders and create pipelines asynchronously in background "
                     "threads. This reduces stutter but may cause brief visual artifacts while "
@@ -284,6 +316,8 @@ bool CommandProcessor::ReadBackNotedResolves(uint32_t address, uint32_t length) 
 
 bool CommandProcessor::ReadBackResolvedMemory(uint32_t physical_address, uint32_t length,
                                               uint32_t timeout_ms) {
+  // gpu_draw_counters: every call, served or not (the draw skip's P3 check wants none).
+  readback_calls_.fetch_add(1, std::memory_order_relaxed);
   if (!length || !worker_running_) {
     return false;
   }
@@ -315,6 +349,31 @@ bool CommandProcessor::ReadBackResolvedMemory(uint32_t physical_address, uint32_
   // Taken: the copy itself is short, and the request lives on this stack until it is done.
   readback_request_cv_.wait(lock, [&request] { return request.done; });
   return request.result;
+}
+
+void CommandProcessor::MaybeLogDrawCounters() {
+  if (!REXCVAR_GET(gpu_draw_counters)) {
+    // Start a fresh window when it is turned on.
+    draw_counters_window_start_ = {};
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (draw_counters_window_start_ == std::chrono::steady_clock::time_point{}) {
+    draw_counters_ = {};
+    readback_calls_.store(0, std::memory_order_relaxed);
+    draw_counters_window_start_ = now;
+    return;
+  }
+  const double seconds =
+      std::chrono::duration<double>(now - draw_counters_window_start_).count();
+  if (seconds < draw_skip::kCounterWindowSeconds) {
+    return;
+  }
+  draw_skip::Counters counters = draw_counters_;
+  counters.readbacks = readback_calls_.exchange(0, std::memory_order_relaxed);
+  REXGPU_INFO("{}", draw_skip::FormatCounters(counters, seconds));
+  draw_counters_ = {};
+  draw_counters_window_start_ = now;
 }
 
 void CommandProcessor::ServeReadBackRequest() {
@@ -809,6 +868,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   } while (reader.read_count());
 
   OnPrimaryBufferEnd();
+  // gpu_draw_counters: also here, so a stretch without swaps (a load) still gets its line.
+  MaybeLogDrawCounters();
 
   return write_index;
 }
@@ -1150,6 +1211,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   // every vblank tick (see GraphicsSystem::MarkVblank) and would otherwise
   // double-count and inflate any FPS computed from it.
   guest_frame_count_.fetch_add(1, std::memory_order_relaxed);
+  // gpu_draw_counters. The draw skip (render_hidden_draw) leaves the two counters above as they
+  // are: they advance here, after IssueSwap returns, whatever IssueSwap did.
+  ++draw_counters_.swaps;
+  MaybeLogDrawCounters();
   return true;
 }
 
@@ -1782,6 +1847,7 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
 
   uint32_t id = dword0 & 0x3F;
   uint32_t end = dword0 & 0x100;
+  ++draw_counters_.viz;  // gpu_draw_counters
   if (!end) {
     // begin a new viz query @ id
     // On hardware this clears the internal state of the scan converter (which

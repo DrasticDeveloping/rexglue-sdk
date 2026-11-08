@@ -427,8 +427,13 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
   auto p = reinterpret_cast<const uint8_t*>(rip);
   DecodedLoadStore decoded_load_store;
   if (!TryDecodeLoadStore(p, decoded_load_store)) {
-    REXLOG_ERROR("Unable to decode MMIO load or store instruction at {:p}",
-                 static_cast<const void*>(p));
+    // The access cannot be emulated and faults again: a crash entry (it goes on to the crash
+    // filter). The exit watchdog is armed before the line (the exit invariant, core/logging.cpp's
+    // async section) and the line is urgent (no unbounded wait for queue room in this exception
+    // handler). Synchronous logging: the same line; the arm does nothing.
+    ::rex::ArmExitWatchdog();
+    REXLOG_URGENT_ERROR("Unable to decode MMIO load or store instruction at {:p}",
+                        static_cast<const void*>(p));
     assert_always("Unknown MMIO instruction type");
     return false;
   }

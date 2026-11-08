@@ -26,6 +26,8 @@ REXCVAR_DECLARE(std::string, log_file);
 REXCVAR_DECLARE(bool, log_verbose);
 REXCVAR_DECLARE(bool, log_noisy);
 REXCVAR_DECLARE(int32_t, log_flush_interval);
+REXCVAR_DECLARE(bool, log_async);
+REXCVAR_DECLARE(int32_t, log_async_queue);
 REXCVAR_DECLARE(int32_t, log_max_file_size_mb);
 REXCVAR_DECLARE(int32_t, log_max_files);
 
@@ -79,8 +81,133 @@ void ShutdownLogging();
  * Use before a hard process exit (std::_Exit) when other threads may still be
  * logging: unlike ShutdownLogging it leaves the registry and sinks intact, so a
  * concurrent logger cannot hit freed state.
+ *
+ * With log_async it waits until the writer thread has written every line queued
+ * before the call and flushed every sink after them, so the lines are on disk when
+ * it returns; at most 3 s from the call (250 ms once a drain found the writer
+ * stuck), and it never calls a sink itself. On the writer thread it returns at once.
  */
 void FlushLogging();
+
+/**
+ * Logs one line of a fatal error or a crash report (REX_FATAL*, REXLOG_URGENT_*).
+ *
+ * With synchronous loggers it is an ordinary log call. With log_async it never waits
+ * without bound for room in the queue (ordinary lines do, the block policy): it keeps
+ * trying to claim a free slot (atomically, under the queue's lock) for at most 500 ms
+ * (one try once a drain found the writer stuck), and only then pushes the oldest
+ * queued line out. On the writer thread itself (a crash inside a sink) it arms the
+ * exit watchdog (ArmExitWatchdog), then writes and flushes the line directly to every
+ * sink except the one the writer is inside. `loc` is the caller's source location
+ * (REXLOG_CAT_URGENT passes __FILE__, __LINE__, __FUNCTION__, as the ordinary macros
+ * do). Call FlushLogging after it before the process ends.
+ */
+void LogUrgent(LogCategoryId category, spdlog::level::level_enum level, std::string_view text,
+               spdlog::source_loc loc = {});
+
+/**
+ * Arms the exit watchdog: with log_async, the process ends (TerminateProcess on Windows,
+ * _Exit elsewhere, exit code 3) 4 s after the first call, whatever the log sinks or any
+ * other code still do then. For crash and fatal paths only (the REX_FATAL macros, crash
+ * handlers; LogUrgent on the log writer arms it itself). Once armed, LogUrgent's room wait
+ * and FlushLogging share that budget: each ends 150 ms before the deadline at the latest
+ * (a thread's first FlushLogging 250 ms earlier still, for the abort handler's after it),
+ * so the watchdog only ends a path stuck in a sink. The first call sets the deadline;
+ * later calls keep it. Does nothing with synchronous logging (no pool): log_async off
+ * and no EnableAsyncLogging (offline play), or a process whose watchdog could not start
+ * (InitLogging and EnableAsyncLogging start the watchdog before the pool; if it cannot,
+ * async mode is refused for the process, the loggers stay synchronous and it logs
+ * `Log: the exit watchdog did not start; logging stays synchronous`).
+ */
+void ArmExitWatchdog();
+
+/**
+ * Unit tests only: what the exit watchdog runs at its deadline instead of ending the
+ * process (null: end it), and disarms it. After the hook ran, it can be armed again.
+ */
+void SetExitWatchdogHookForTesting(void (*hook)());
+
+/**
+ * Unit tests only: a function EnableAsyncLogging calls at the last instant before it publishes
+ * its replacement logger table (with g_mutex and the level lock held: the hook may only call
+ * GetLoggerRaw and record what it sees). Null: none. Lets a test prove that no category is
+ * asynchronous before the one publication (Sol, narrow round on the switch, M1).
+ */
+void SetSwitchPublishHookForTesting(void (*hook)());
+
+/**
+ * Unit tests only, and only from inside the publish hook above (its thread already holds the locks
+ * this reads under, so it takes none): how many registered categories' current loggers are
+ * synchronous and how many asynchronous. The order test checks every category this way, not a
+ * sample (the root-cause analysis of the switch's order test, M1).
+ */
+void LoggerModeCountsForTesting(size_t& sync, size_t& async);
+
+/**
+ * Unit tests only: with `fail`, the next watchdog start (InitLogging with log_async, or
+ * EnableAsyncLogging) fails as if its thread could not be created (async mode is then
+ * refused). Every call also clears an earlier failure's "refused for the process", so a
+ * later InitLogging or EnableAsyncLogging tries again.
+ */
+void SetExitWatchdogStartFailureForTesting(bool fail);
+
+/** Unit tests only: whether the exit watchdog is armed now (a deadline is set). */
+bool ExitWatchdogArmedForTesting();
+
+/**
+ * Whether async mode is on: log_async was on at InitLogging, or EnableAsyncLogging
+ * switched, and the exit watchdog started, so the queue and its writer thread exist.
+ */
+bool LogAsyncActive();
+
+/**
+ * Turns asynchronous logging on for the rest of the process, as log_async does at
+ * InitLogging (an online client at its first online session, so play before it keeps
+ * the synchronous loggers). One-way and idempotent: true when every category logger is
+ * asynchronous on return (switched now or earlier, or log_async at init); false when
+ * the loggers stay synchronous: before InitLogging; the exit watchdog could not start
+ * (logs `Log: the exit watchdog did not start; logging stays synchronous`), the queue
+ * could not be made (`Log: the log queue could not be made; logging stays synchronous`)
+ * or an asynchronous logger could not be made (`Log: the asynchronous loggers could not
+ * be made; logging stays synchronous`), after which every later call returns false at
+ * once; or the log lock stayed busy for 3 s (a synchronous FlushLogging stuck in a sink;
+ * a later call may try again). A refused switch changes no logger. A switch logs
+ * `Log: asynchronous from now on, queue <n> lines, one writer`, which marks it (another
+ * thread's line can be queued just before it).
+ *
+ * Any thread after InitLogging, except: a crash or signal handler, a log sink or
+ * formatter, the log writer thread. It never calls a sink and never waits for one (but
+ * for the refusal warning above, which the synchronous loggers write); it waits at most
+ * 3 s for the log lock. Every category logger is replaced by an asynchronous one with
+ * the same sinks, level and flush level; the synchronous loggers it replaces are never
+ * freed, so a pointer taken from GetLoggerRaw or GetLogger before the switch stays valid
+ * (and logs synchronously). Order: one thread's lines to one category keep their order
+ * across the switch; across categories too, except for lines logged during the swap
+ * itself (microseconds), where a line to a category not yet swapped can reach the sinks
+ * before an earlier, queued one. From the switch on, crash and fatal paths are bounded
+ * by the exit watchdog (ArmExitWatchdog). spdlog's own registry is left as it was (it
+ * keeps the replaced loggers; nothing here reads it).
+ */
+bool EnableAsyncLogging();
+
+/**
+ * What LogUrgent could not deliver whole, since the start: `missed_sink`, lines a sink
+ * missed because the writer was inside it; `displaced`, queued lines an urgent line
+ * pushed out of a full queue (this log_async queue; 0 when logging is synchronous).
+ */
+void UrgentLogCounts(size_t& missed_sink, size_t& displaced);
+
+/**
+ * The slowest sink write or flush over 1000 ms since the last call, if any.
+ *
+ * Every sink is timed around its write and its flush (the redacting wrapper).
+ * Returns false when none took that long. Otherwise fills in the time, the sink
+ * ("debug", "console", "file", "capture" or "added" for a sink given to AddSink
+ * or LogConfig::extra_sinks), and how many lines the log_async queue held when
+ * that write ended, i.e. the backlog behind it (0 when logging is synchronous),
+ * and clears the record.
+ */
+bool TakeSlowLogWrite(uint32_t& ms, const char*& sink, size_t& queued);
 
 /**
  * Register a new log category at runtime.
@@ -119,7 +246,11 @@ std::span<const LogCategoryEntry> GetAllCategories();
  * Get the raw logger pointer for a category (zero overhead).
  *
  * This is the fast path used by logging macros. Returns nullptr if
- * the category is not yet initialized.
+ * the category is not yet initialized. Lock-free (one atomic load). A pointer
+ * taken from InitLogging on stays valid until ShutdownLogging, even after
+ * EnableAsyncLogging replaced the category's logger (fetch it again per call to
+ * follow the switch); one taken before InitLogging is freed by InitLogging's
+ * rebuild of the loggers.
  *
  * @param category  Category handle.
  * @return          Raw pointer to the spdlog logger (not owning).
@@ -167,6 +298,9 @@ void RegisterLogLevelCallback();
 
 /**
  * Add a sink to all current and future loggers.
+ *
+ * Call it only before other threads log (the loggers' sink lists are not locked
+ * against the log_async writer); with log_async it first waits for the queue.
  *
  * @param sink  Shared pointer to the spdlog sink.
  */

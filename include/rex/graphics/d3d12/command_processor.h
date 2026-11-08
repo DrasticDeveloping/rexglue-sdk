@@ -710,6 +710,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t* occlusion_query_readback_mapping_ = nullptr;
   uint32_t occlusion_query_cursor_ = 0;
   bool occlusion_query_resources_available_ = false;
+
+  // The hidden game's draw skip (render_hidden_draw off with window_hidden on, rex/graphics/
+  // draw_skip.h), decided once in SetupContext: IssueDraw skips draws without memexport, IssueCopy
+  // skips the resolve, IssueSwap keeps only its frame bookkeeping, and EVENT_WRITE_ZPD takes the
+  // base class's fake sample count. Resolve readback counts as it is at startup.
+  bool skip_hidden_draws_ = false;
+  // IssueCopy's one warning that resolve readback, turned on after startup, is ignored under the
+  // skip until a restart.
+  bool warned_readback_under_skip_ = false;
   struct ActiveOcclusionQuery {
     uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;

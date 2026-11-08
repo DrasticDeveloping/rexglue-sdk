@@ -40,6 +40,20 @@
 #define REXLOG_CAT_CRITICAL(cat, ...) REX_LOG_IMPL(cat, spdlog::level::critical, __VA_ARGS__)
 /** @} */
 
+/* --- Urgent Macros (fatal errors, crash reports) --------------------------- */
+
+/* A line that must not wait without bound for room in the log_async queue (LogUrgent): the
+   REX_FATAL macros and crash handlers, followed by ::rex::FlushLogging(). The format is always
+   evaluated. The caller's source location goes with it, as with REX_LOG_IMPL. Ordinary lines keep
+   the macros above. */
+#define REXLOG_CAT_URGENT(cat, lvl, ...)                                \
+  ::rex::LogUrgent(cat, lvl, ::fmt::format(__VA_ARGS__),                \
+                   spdlog::source_loc{__FILE__, __LINE__, __FUNCTION__})
+#define REXLOG_URGENT_ERROR(...) \
+  REXLOG_CAT_URGENT(::rex::log::core(), spdlog::level::err, __VA_ARGS__)
+#define REXLOG_URGENT_INFO(...) \
+  REXLOG_CAT_URGENT(::rex::log::core(), spdlog::level::info, __VA_ARGS__)
+
 /* --- Noisy Parameterized Macros (cvar-gated) ------------------------------ */
 
 #define REXLOG_CAT_NOISY_TRACE(cat, ...) REX_LOG_NOISY_IMPL(cat, spdlog::level::trace, __VA_ARGS__)

@@ -90,7 +90,13 @@ static void FiberEntryPoint(void* raw_arg) {
     PROFILE_FIBER_LEAVE;
     rex::thread::Fiber::SwitchTo(thread->main_fiber());
   }
+  // A dead end (std::terminate aborts): the exit watchdog is armed before the line (the exit
+  // invariant, core/logging.cpp's async section; with log_async the process then ends within 4 s
+  // even if a log sink hangs), and the line is flushed before the abort. Synchronous logging: the
+  // same line, then a flush; the arm does nothing.
+  ::rex::ArmExitWatchdog();
   REXKRNL_WARN("FiberEntryPoint: fiber function returned with no main fiber - terminating");
+  ::rex::FlushLogging();
   std::terminate();
 }
 

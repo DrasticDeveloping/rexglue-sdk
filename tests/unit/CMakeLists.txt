@@ -11,6 +11,7 @@ add_executable(unit_tests
     core/vfs_overwrite_test.cpp
     core/hash_test.cpp
     core/log_redact_test.cpp
+    core/log_async_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
     ppc/import_function_test.cpp
@@ -21,6 +22,7 @@ add_executable(unit_tests
     input/input_assignment_test.cpp
     graphics/shader_constant_overrides_test.cpp
     graphics/edram_layout_test.cpp
+    graphics/draw_skip_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
