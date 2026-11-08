@@ -11,12 +11,14 @@
 
 #include <array>
 #include <cstring>
+#include <cwctype>
 #include <fstream>
 #include <queue>
 #include <string>
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
@@ -27,6 +29,14 @@
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xobject.h>
+
+// Swap Force Online stage 1C (design 3.5, `trace_content_hash`): the ground truth the save handover
+// is graded against. In every committing CloseContent of a saved game the files of the package are
+// hashed inside the detaching lock acquisition, right after the commit's handles are closed and its
+// count is raised, and logged after the lock. Trace capture only: the native save's file operations
+// and their order are unchanged.
+REXCVAR_DEFINE_BOOL(trace_content_hash, false, "Content",
+                    "Developer trace: log the SHA-256 of each committed saved game with its commit count");
 
 namespace rex {
 namespace system {
@@ -123,8 +133,9 @@ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_p
 }
 
 ContentManager::ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path)
-    : kernel_state_(kernel_state), root_path_(root_path) {
+    : kernel_state_(kernel_state), root_path_(root_path), import_journal_(root_path) {
   RecoverInterruptedReplacements();
+  RecoverInterruptedImports();
 }
 
 ContentManager::~ContentManager() = default;
@@ -324,6 +335,8 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
       return X_ERROR_ALREADY_EXISTS;
     }
     open_packages_.insert({string::string_key_case::create(root_name), package.release()});
+    // Stage 1C: closing this package is a commit (the commit counter, CloseContent).
+    created_roots_.insert(string::string_key_case::create(root_name));
   }
   return X_ERROR_SUCCESS;
 }
@@ -360,6 +373,10 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
 
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   ContentPackage* package = nullptr;
+  // Stage 1C: the commit count and (trace_content_hash) the hashes, captured in this acquisition.
+  uint64_t commit = 0;
+  std::string commit_id;
+  std::vector<std::pair<std::string, Sha256>> commit_hashes;
   {
     auto global_lock = global_critical_region_.Acquire();
     // Some games use different casing between Create and Close (e.g. "save" vs "SAVE")
@@ -367,7 +384,33 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
     if (it == open_packages_.end()) {
       return X_ERROR_FILE_NOT_FOUND;
     }
+    // A close commits when CreateContent made the package or a replacement is pending for the
+    // root (the entry the second acquisition below takes); a read-only close does not count.
+    const bool created = created_roots_.erase(string::string_key_case(root_name)) > 0;
+    const bool commits =
+        created || pending_replacements_.count(string::string_key_case(root_name)) > 0;
     package = DetachPackage(it);
+    if (commits) {
+      // The guest's files in the package are closed now (DetachPackage), so the bytes are this
+      // commit's; a later save's ReplaceContent waits for this lock before it touches them.
+      commit_id = PackageIdOfPath(package->package_path());
+      commit = commit_counter_.Raise(commit_id);
+      if (REXCVAR_GET(trace_content_hash) &&
+          package->GetPackageContentData().content_type == XContentType::kSavedGame) {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(package->package_path(), ec)) {
+          if (!entry.is_regular_file(ec)) continue;
+          std::vector<uint8_t> bytes;
+          Sha256 sha{};
+          if (ReadWholeFile(entry.path(), &bytes) == 0 && Sha256Of(bytes, &sha)) {
+            commit_hashes.emplace_back(rex::path_to_utf8(entry.path().filename()), sha);
+          }
+        }
+      }
+    }
+  }
+  for (const auto& [file, sha] : commit_hashes) {
+    REXSYS_INFO("Content: {} commit {} sha {} ({})", commit_id, commit, Sha256Hex(sha), file);
   }
   std::string pending_id;
   {
@@ -578,6 +621,7 @@ X_RESULT ContentManager::UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_
     if (it == open_packages_.end()) {
       return X_ERROR_FILE_NOT_FOUND;
     }
+    created_roots_.erase(it->first);
     package = DetachPackage(it);
   }
   delete package;
@@ -592,6 +636,7 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
     auto global_lock = global_critical_region_.Acquire();
     auto it = FindOpenPackageByData(data);
     if (it != open_packages_.end()) {
+      created_roots_.erase(it->first);
       package = DetachPackage(it);
     }
   }
@@ -697,6 +742,118 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
     }
   }
 }
+
+// ---- Swap Force Online stage 1C ------------------------------------------------------------------
+
+std::string ContentManager::PackageIdOfPath(const std::filesystem::path& package_path) const {
+  return PackageId(package_path.lexically_relative(root_path_));
+}
+
+bool ContentManager::IsSavedGameOpenLocked(const XCONTENT_AGGREGATE_DATA& data) const {
+  // Conservative: type, file name and title, whatever the device or the profile.
+  auto resolve = [this](uint32_t title) {
+    return (title == kCurrentlyRunningTitleId && kernel_state_) ? kernel_state_->title_id() : title;
+  };
+  const uint32_t query_title = resolve(data.title_id);
+  return std::any_of(open_packages_.cbegin(), open_packages_.cend(), [&](const auto& content) {
+    const auto& pkg = content.second->GetPackageContentData();
+    return pkg.content_type == data.content_type && pkg.file_name() == data.file_name() &&
+           resolve(pkg.title_id) == query_title;
+  });
+}
+
+namespace {
+// Paths compared as Windows does: normalized, case-insensitive, either separator.
+bool SamePath(const std::filesystem::path& a, const std::filesystem::path& b) {
+  const std::wstring x = a.lexically_normal().wstring(), y = b.lexically_normal().wstring();
+  if (x.size() != y.size()) return false;
+  for (size_t i = 0; i < x.size(); ++i) {
+    const wchar_t c = x[i] == L'/' ? L'\\' : x[i];
+    const wchar_t d = y[i] == L'/' ? L'\\' : y[i];
+    if (std::towlower(c) != std::towlower(d)) return false;
+  }
+  return true;
+}
+}  // namespace
+
+X_RESULT ContentManager::ImportSavedGame(const SaveImportBinding& binding,
+                                         const std::filesystem::path& staged, const Sha256& new_sha,
+                                         const Sha256& base_sha, uint32_t seq,
+                                         ImportReport* report) {
+  auto refuse = [report](X_RESULT result, const char* reason) {
+    if (report) report->reason = reason;
+    return result;
+  };
+  // Step 0, the binding (design D20): the owner's header, its profile, and the paths the SDK
+  // resolves for it (ResolvePackagePath lets a header's xuid override the xuid argument).
+  XCONTENT_AGGREGATE_DATA data{};
+  if (ReadContentHeaderFile(binding.file_name, binding.xuid, binding.title_id,
+                            XContentType::kSavedGame, data) != X_ERROR_SUCCESS) {
+    return refuse(X_ERROR_FILE_NOT_FOUND, "header");
+  }
+  const uint64_t header_xuid = data.xuid;
+  if (header_xuid != binding.xuid && header_xuid != 0 && header_xuid != uint64_t(-1)) {
+    return refuse(X_ERROR_ACCESS_DENIED, "profile");
+  }
+  const uint32_t header_title = data.title_id;
+  if (data.file_name() != binding.file_name || data.content_type != XContentType::kSavedGame ||
+      (header_title != binding.title_id && header_title != kCurrentlyRunningTitleId)) {
+    return refuse(X_ERROR_ACCESS_DENIED, "header content");
+  }
+  data.title_id = binding.title_id;
+  const auto package_dir = ResolvePackagePath(binding.xuid, data);
+  const auto header_path = ResolvePackageHeaderPath(binding.file_name, binding.xuid,
+                                                    binding.title_id, XContentType::kSavedGame);
+  if (!SamePath(package_dir, binding.package_file.parent_path()) ||
+      !SamePath(header_path, binding.header_file)) {
+    return refuse(X_ERROR_ACCESS_DENIED, "bound path");
+  }
+  SaveImportJournal::Request request;
+  request.id = PackageIdOfPath(package_dir);
+  request.package_file = binding.package_file;
+  request.header_file = binding.header_file;
+  request.staged = staged;
+  request.new_sha = new_sha;
+  request.base_sha = base_sha;
+  request.seq = seq;
+  request.file_size = binding.file_size;
+  return import_journal_.Import(
+      request,
+      [this, &data](const std::function<uint32_t(bool)>& body) {
+        auto global_lock = global_critical_region_.Acquire();
+        return body(IsSavedGameOpenLocked(data));
+      },
+      report);
+}
+
+X_RESULT ContentManager::SnapshotSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+                                           const std::string& file_in_package,
+                                           uint64_t expected_size, std::vector<uint8_t>* bytes,
+                                           uint64_t* commit_count) {
+  const auto package_dir = ResolvePackagePath(xuid, data);
+  const std::string id = PackageIdOfPath(package_dir);
+  auto global_lock = global_critical_region_.Acquire();
+  std::error_code ec;
+  if (IsSavedGameOpenLocked(data) || std::filesystem::exists(import_journal_.PendingDir(id), ec) ||
+      std::filesystem::exists(import_journal_.ImportDir(id), ec)) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  std::vector<uint8_t> read;
+  if (ReadWholeFile(package_dir / rex::to_path(file_in_package), &read) != 0 ||
+      read.size() != expected_size) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  *bytes = std::move(read);
+  *commit_count = commit_counter_.Current(id);
+  return X_ERROR_SUCCESS;
+}
+
+uint64_t ContentManager::CommitCountRaisedByThisThread(uint64_t xuid,
+                                                       const XCONTENT_AGGREGATE_DATA& data) {
+  return commit_counter_.RaisedByThisThread(PackageIdOfPath(ResolvePackagePath(xuid, data)));
+}
+
+void ContentManager::RecoverInterruptedImports() { import_journal_.Recover(); }
 
 static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
                              const std::filesystem::path& base_path) {

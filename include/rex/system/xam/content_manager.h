@@ -14,11 +14,13 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/string/key.h>
 #include <rex/string.h>
+#include <rex/system/xam/save_import.h>
 #include <rex/system/xcontent.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
@@ -139,6 +141,18 @@ class ContentPackage {
   uint32_t license_ = 0;
 };
 
+// The session's binding of an import to the owner's profile and slot (Swap Force Online stage 1C,
+// design D20): the exact paths recorded at Host. ImportSavedGame refuses unless the SDK resolves the
+// owner's header to the same package and header paths.
+struct SaveImportBinding {
+  uint64_t xuid = 0;            // the owner's signed-in profile
+  uint32_t title_id = 0;        // the running title (explicit: no kernel lookup)
+  std::string file_name;        // the content's file name, e.g. "SWAPFORCE_1"
+  std::filesystem::path package_file;  // the live data file inside the package folder
+  std::filesystem::path header_file;   // the package's header
+  uint64_t file_size = 0;       // the exact length of the data file
+};
+
 class ContentManager {
  public:
   ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path);
@@ -189,6 +203,25 @@ class ContentManager {
   // and writes a .header file for XAM enumeration.
   X_RESULT InstallContent(const std::filesystem::path& package_path);
 
+  // ---- Swap Force Online stage 1C (save_import.h; none of it runs unless a caller asks) ----------
+  // Replaces the bound saved game's data file with `staged` through the import journal: success
+  // (committed), X_ERROR_IO_INCOMPLETE (installed, not committed; the package is refused for the
+  // rest of the process), or a refusal with the live file and the header byte-equal to before.
+  X_RESULT ImportSavedGame(const SaveImportBinding& binding, const std::filesystem::path& staged,
+                           const Sha256& new_sha, const Sha256& base_sha, uint32_t seq,
+                           ImportReport* report = nullptr);
+  // Reads `file_in_package` of a closed saved game whole, under the content manager's lock, with
+  // the package's commit count. X_ERROR_ACCESS_DENIED while the package is open, while a native
+  // pending or an import folder exists for it, or while the file is missing or not
+  // `expected_size` bytes.
+  X_RESULT SnapshotSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+                             const std::string& file_in_package, uint64_t expected_size,
+                             std::vector<uint8_t>* bytes, uint64_t* commit_count);
+  // The latest commit count the calling thread's CloseContent raised for the package, 0 if none.
+  uint64_t CommitCountRaisedByThisThread(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  // In the constructor, after RecoverInterruptedReplacements; a no-op without save-backup/import.
+  void RecoverInterruptedImports();
+
  private:
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
@@ -209,11 +242,21 @@ class ContentManager {
   void CommitReplacement(const std::string& id);
   void RecoverInterruptedReplacements();
 
+  // Stage 1C: the package id of a package folder (as ReplaceContent's), and whether a saved game
+  // matching `data` (type, file name, title; any device or profile) is open. Lock held.
+  std::string PackageIdOfPath(const std::filesystem::path& package_path) const;
+  bool IsSavedGameOpenLocked(const XCONTENT_AGGREGATE_DATA& data) const;
+
   KernelState* kernel_state_;
   std::filesystem::path root_path_;
   // Open packages with an uncommitted ReplaceContent: root name -> pending id.
   std::unordered_map<string::string_key_case, std::string, string::string_key_case::Hash>
       pending_replacements_;
+  // Stage 1C: open packages CreateContent made (root names), whose close is a commit; the commit
+  // counter; the import journal.
+  std::unordered_set<string::string_key_case, string::string_key_case::Hash> created_roots_;
+  CommitCounter commit_counter_;
+  SaveImportJournal import_journal_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;
