@@ -377,6 +377,7 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   uint64_t commit = 0;
   std::string commit_id;
   std::vector<std::pair<std::string, Sha256>> commit_hashes;
+  bool trace_complete = true;  // false: the trace's listing or a hash failed, nothing is logged
   {
     auto global_lock = global_critical_region_.Acquire();
     // Some games use different casing between Create and Close (e.g. "save" vs "SAVE")
@@ -397,20 +398,38 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
       commit = commit_counter_.Raise(commit_id);
       if (REXCVAR_GET(trace_content_hash) &&
           package->GetPackageContentData().content_type == XContentType::kSavedGame) {
+        // The 1C council's Opus B3: the listing advances with increment(ec) (a range-for's
+        // operator++ throws when the enumeration fails partway, here inside the guest's call) and
+        // is taken in full before anything is hashed. Any listing, status, read or hash error
+        // drops every hash line of this commit (one warning instead), so a partial set of files
+        // is never logged as the commit's.
         std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(package->package_path(), ec)) {
-          if (!entry.is_regular_file(ec)) continue;
+        std::vector<std::filesystem::path> files;
+        std::filesystem::directory_iterator it(package->package_path(), ec);
+        const std::filesystem::directory_iterator end;
+        while (!ec && it != end) {
+          const bool regular = it->is_regular_file(ec);
+          if (ec) break;
+          if (regular) files.push_back(it->path());
+          it.increment(ec);
+        }
+        trace_complete = !ec;
+        for (size_t i = 0; trace_complete && i < files.size(); ++i) {
           std::vector<uint8_t> bytes;
           Sha256 sha{};
-          if (ReadWholeFile(entry.path(), &bytes) == 0 && Sha256Of(bytes, &sha)) {
-            commit_hashes.emplace_back(rex::path_to_utf8(entry.path().filename()), sha);
-          }
+          trace_complete = ReadWholeFile(files[i], &bytes) == 0 && Sha256Of(bytes, &sha);
+          if (trace_complete) commit_hashes.emplace_back(rex::path_to_utf8(files[i].filename()), sha);
         }
+        if (!trace_complete) commit_hashes.clear();
       }
     }
   }
   for (const auto& [file, sha] : commit_hashes) {
     REXSYS_INFO("Content: {} commit {} sha {} ({})", commit_id, commit, Sha256Hex(sha), file);
+  }
+  if (!trace_complete) {
+    REXSYS_WARN("Content: {} commit {} not hashed (the package could not be listed or read)", commit_id,
+                commit);
   }
   std::string pending_id;
   {
