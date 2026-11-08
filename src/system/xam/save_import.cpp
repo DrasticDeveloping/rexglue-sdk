@@ -267,6 +267,57 @@ std::string TimeStamp() {
                      tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
+// The Win32 error in a filesystem error_code (ERROR_ACCESS_DENIED when it carries none).
+uint32_t WinErrorOf(const std::error_code& ec) {
+  if (ec.category() == std::system_category() && ec.value() != 0) return uint32_t(ec.value());
+  return ERROR_ACCESS_DENIED;
+}
+
+// One status query with its error inspected at once. Only a plain not-found (ERROR_FILE_NOT_FOUND,
+// ERROR_PATH_NOT_FOUND) is kMissing; every other failure is kError, which each caller treats as
+// present and unreadable (it refuses or keeps the folder), never as absent. A non-null `point` is
+// a fault point: a non-zero hook value makes the query fail with that error.
+enum class PathState { kMissing, kDirectory, kOther, kError };
+PathState StatusOf(const std::filesystem::path& path, const char* point = nullptr,
+                   uint32_t* error = nullptr) {
+  std::error_code ec;
+  const std::filesystem::file_type type = std::filesystem::status(path, ec).type();
+  uint32_t err = point ? RunImportFaultPoint(point) : 0;
+  if (!err && ec) {
+    if (ec.category() == std::system_category() &&
+        (ec.value() == ERROR_FILE_NOT_FOUND || ec.value() == ERROR_PATH_NOT_FOUND)) {
+      return PathState::kMissing;
+    }
+    err = WinErrorOf(ec);
+  }
+  if (!err) {
+    if (type == std::filesystem::file_type::directory) return PathState::kDirectory;
+    if (type != std::filesystem::file_type::none && type != std::filesystem::file_type::not_found &&
+        type != std::filesystem::file_type::unknown) {
+      return PathState::kOther;
+    }
+    err = ERROR_ACCESS_DENIED;
+  }
+  if (error) *error = err;
+  return PathState::kError;
+}
+
+// The entries of a folder, advanced with increment(ec): a range-for's operator++ throws when the
+// enumeration fails partway. Point `point` runs at each entry; a non-zero hook value fails the
+// listing there. A Win32 error (the list then incomplete), 0 when every entry was listed.
+uint32_t ListFolder(const std::filesystem::path& dir, const char* point,
+                    std::vector<std::filesystem::directory_entry>* out) {
+  std::error_code ec;
+  std::filesystem::directory_iterator it(dir, ec);
+  const std::filesystem::directory_iterator end;
+  while (!ec && it != end) {
+    if (uint32_t err = RunImportFaultPoint(point)) return err;
+    out->push_back(*it);
+    it.increment(ec);
+  }
+  return ec ? WinErrorOf(ec) : 0;
+}
+
 }  // namespace
 
 uint32_t DurableWrite(const std::filesystem::path& path, std::span<const uint8_t> bytes,
@@ -311,18 +362,22 @@ uint32_t DurableWrite(const std::filesystem::path& path, std::span<const uint8_t
 }
 
 uint32_t DeleteImportFolder(const std::filesystem::path& dir, const std::string& op) {
-  std::error_code ec;
-  if (!std::filesystem::exists(dir, ec)) return 0;
+  // A folder whose status or listing fails is kept whole (nothing deleted) and reported.
+  uint32_t status_err = 0;
+  const PathState state = StatusOf(dir, (op + ".stat").c_str(), &status_err);
+  if (state == PathState::kMissing) return 0;
+  if (state == PathState::kError) return status_err;
+  std::vector<std::filesystem::directory_entry> entries;
+  if (uint32_t err = ListFolder(dir, (op + ".enum").c_str(), &entries)) return err;
   std::vector<std::filesystem::path> files;
   bool has_txn = false;
-  for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+  for (const auto& entry : entries) {
     if (entry.path().filename() == L"txn") {
       has_txn = true;
     } else {
       files.push_back(entry.path());
     }
   }
-  if (ec) return ERROR_ACCESS_DENIED;
   std::sort(files.begin(), files.end());
   bool first = true;
   for (const auto& f : files) {
@@ -394,6 +449,7 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
   };
 
   // ---- Step 0: checks. ----
+  if (recovery_incomplete_) return refuse(kErrBusy, "recovery incomplete");
   if (unresolved_.count(rq.id)) return refuse(kErrBusy, "unresolved");
   if (orphaned_.count(rq.id)) return refuse(kErrBusy, "orphaned");
   std::vector<uint8_t> staged;
@@ -416,9 +472,13 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
     if (staged_vol != live_vol) return refuse(kErrNotSupported, "another volume");
     if (!live_ntfs || RunImportFaultPoint("volume") != 0) return refuse(kErrNotSupported, "not NTFS");
   }
-  std::error_code ec;
-  if (std::filesystem::exists(PendingDir(rq.id), ec)) return refuse(kErrBusy, "native pending");
-  if (std::filesystem::exists(ImportDir(rq.id), ec)) {
+  // A status that cannot be established refuses: never taken for a missing folder.
+  const PathState pending = StatusOf(PendingDir(rq.id), "stat.pending");
+  if (pending == PathState::kError) return refuse(kErrBusy, "pending status");
+  if (pending != PathState::kMissing) return refuse(kErrBusy, "native pending");
+  const PathState folder = StatusOf(ImportDir(rq.id), "stat.import");
+  if (folder == PathState::kError) return refuse(kErrBusy, "import status");
+  if (folder != PathState::kMissing) {
     // Only a committed import whose cleanup failed (live = its new file) is finished here.
     std::vector<uint8_t> text;
     ImportTxn old_txn;
@@ -444,8 +504,9 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
 
   // ---- Steps 1 to 4: the folder, the copies, the prepared record. ----
   const auto dir = ImportDir(rq.id);
+  std::error_code ec;
   std::filesystem::create_directories(dir, ec);
-  if (ec || !std::filesystem::is_directory(dir, ec)) return refuse(ERROR_ACCESS_DENIED, "folder");
+  if (ec || StatusOf(dir) != PathState::kDirectory) return refuse(ERROR_ACCESS_DENIED, "folder");
   RunImportFaultPoint("I1");
   if (uint32_t err = DurableWrite(dir / L"old.xsg", live, rq.base_sha, "old.xsg", "I2")) {
     return Abort(rq.id, X_RESULT_FROM_WIN32(err), "old copy", report);
@@ -482,7 +543,7 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
 
   // ---- Step 5: the install, under the lock. ----
   const auto new_file = dir / L"new.xsg";
-  enum class Check { kNone, kOpen, kPending, kBase };
+  enum class Check { kNone, kOpen, kPending, kPendingStatus, kBase };
   Check failed = Check::kNone;
   uint32_t rename_err = 0;
   for (int attempt = 0; attempt < 4; ++attempt) {
@@ -493,9 +554,9 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
         failed = Check::kOpen;
         return kErrBusy;
       }
-      std::error_code lec;
-      if (std::filesystem::exists(PendingDir(rq.id), lec)) {
-        failed = Check::kPending;
+      const PathState pending_now = StatusOf(PendingDir(rq.id), "stat.pending");
+      if (pending_now != PathState::kMissing) {
+        failed = pending_now == PathState::kError ? Check::kPendingStatus : Check::kPending;
         return kErrBusy;
       }
       Sha256 now{};
@@ -514,6 +575,9 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
   }
   if (failed == Check::kOpen) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "open", report);
   if (failed == Check::kPending) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "native pending", report);
+  if (failed == Check::kPendingStatus) {
+    return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "pending status", report);
+  }
   if (failed == Check::kBase) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "base differs", report);
   if (rename_err) return Abort(rq.id, X_RESULT_FROM_WIN32(rename_err), "install refused", report);
   RunImportFaultPoint("I7");
@@ -555,12 +619,43 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
 
 void SaveImportJournal::Recover() {
   std::lock_guard serial(mutex_);
+  // Recover runs in the content manager's constructor with every setting at its default, so
+  // nothing may leave it as an exception. Its filesystem calls take error codes; this catches
+  // what is left (an allocation): the folders not yet settled stay, imports are refused.
+  try {
+    RecoverLocked();
+  } catch (...) {
+    recovery_incomplete_ = true;
+    REXSYS_ERROR("Content: recovering the import folders failed; imports are refused until the "
+                 "next start");
+  }
+}
+
+void SaveImportJournal::RecoverLocked() {
   const auto import_root = root_ / kBackupDir / "import";
   std::error_code ec;
-  if (!std::filesystem::is_directory(import_root, ec)) return;
+  // A status or a listing that fails settles nothing: every folder is kept and imports are
+  // refused for the process (the next start tries again).
+  uint32_t list_err = 0;
+  const PathState root_state = StatusOf(import_root, nullptr, &list_err);
+  if (root_state == PathState::kMissing || root_state == PathState::kOther) return;
   std::vector<std::filesystem::path> dirs;
-  for (const auto& entry : std::filesystem::directory_iterator(import_root, ec)) {
-    if (entry.is_directory(ec)) dirs.push_back(entry.path());
+  if (root_state == PathState::kDirectory) {
+    std::vector<std::filesystem::directory_entry> entries;
+    list_err = ListFolder(import_root, "recover.enum", &entries);
+    for (size_t i = 0; !list_err && i < entries.size(); ++i) {
+      std::error_code entry_ec;
+      const bool is_dir = entries[i].is_directory(entry_ec);
+      if (entry_ec) list_err = WinErrorOf(entry_ec);
+      else if (is_dir) dirs.push_back(entries[i].path());
+    }
+  }
+  if (list_err) {
+    recovery_incomplete_ = true;
+    REXSYS_ERROR("Content: the import folders in {} cannot be listed ({}); none is settled and "
+                 "imports are refused until the next start",
+                 rex::path_to_utf8(import_root), list_err);
+    return;
   }
   for (const auto& dir : dirs) {
     const std::string id = rex::path_to_utf8(dir.filename());
@@ -568,7 +663,17 @@ void SaveImportJournal::Recover() {
     ImportTxn txn;
     std::vector<uint8_t> text;
     const auto txn_path = dir / L"txn";
-    if (!std::filesystem::exists(txn_path, ec)) {
+    uint32_t txn_err = 0;
+    const PathState txn_state = StatusOf(txn_path, "stat.txn", &txn_err);
+    if (txn_state == PathState::kError) {
+      // Unreadable is not absent: the folder stays as it is and its imports are refused.
+      unresolved_.insert(id);
+      REXSYS_ERROR("Content: the record of the import folder {} cannot be read ({}); the folder is "
+                   "kept and imports of it are refused",
+                   rex::path_to_utf8(dir), txn_err);
+      continue;
+    }
+    if (txn_state == PathState::kMissing) {
       decision = Decision::kDiscard;  // a stop before I6: the install never ran
     } else if (ReadWholeFile(txn_path, &text) == 0 &&
                ParseImportTxn(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()),
@@ -643,6 +748,7 @@ X_RESULT SaveImportJournal::Import(const Request&, const LockedRunner&, ImportRe
   return kImportNotSupported;
 }
 void SaveImportJournal::Recover() {}
+void SaveImportJournal::RecoverLocked() {}
 uint32_t SaveImportJournal::FinishCommitted(const std::string&, const char*) { return kErrNotSupported; }
 X_RESULT SaveImportJournal::Abort(const std::string&, X_RESULT result, const std::string&, ImportReport*) {
   return result;

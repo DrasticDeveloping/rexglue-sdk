@@ -809,6 +809,101 @@ TEST_CASE("an import over an unresolved transaction is refused (stage 7's additi
   RemoveRoot(slot.root);
 }
 
+// ---- Status and listing errors: never taken for a missing path, nothing settled -------------------
+
+TEST_CASE("a status error refuses the import or keeps the folder", "[save_import][errors]") {
+  HookGuard hook;
+  SECTION("the pending folder at step 0 and at step 5, the import folder at step 0") {
+    for (const char* point : {"stat.pending", "stat.pending.5", "stat.import"}) {
+      Slot slot;
+      ContentManager cm(nullptr, slot.root);
+      INFO("point " << point);
+      g_hook.on_point = nullptr;
+      g_hook.fail_code = ERROR_ACCESS_DENIED;
+      if (std::strcmp(point, "stat.pending.5") == 0) {
+        g_hook.on_point = [](const char* p) {
+          if (std::strcmp(p, "I6") == 0) g_hook.fail_at = "stat.pending";  // step 5's query
+        };
+      } else {
+        g_hook.fail_at = point;
+      }
+      ImportReport r;
+      CHECK(slot.Import(cm, Content(2), 1, &r) != X_ERROR_SUCCESS);
+      CHECK(r.reason == (std::strcmp(point, "stat.import") == 0 ? "import status" : "pending status"));
+      ExpectUnchanged(slot, Content(1));
+      RemoveRoot(slot.root);
+    }
+  }
+  SECTION("recovery's record: kept and refused, settled once it can be read") {
+    Slot slot;
+    slot.Stage(Content(2), "child");
+    REQUIRE(RunChild(Spec("import", slot, "I6")) == kHitCode);  // prepared, live = old
+    g_hook.fail_at = "stat.txn";
+    g_hook.fail_code = ERROR_ACCESS_DENIED;
+    {
+      ContentManager cm(nullptr, slot.root);
+      CHECK(fs::exists(slot.ImportDir() / "txn"));  // not discarded as a folder without a record
+      CHECK(fs::exists(slot.ImportDir() / "old.xsg"));
+      CHECK_FALSE(HasOrphan(slot));
+      ImportReport r;
+      CHECK(slot.Import(cm, Content(3), 2, &r) != X_ERROR_SUCCESS);
+      CHECK(r.reason == "unresolved");
+      CHECK(GetFile(slot.live) == Content(1));
+    }
+    ExpectSettled(slot, Content(1));  // the record readable again: did not happen, deleted
+    RemoveRoot(slot.root);
+  }
+  SECTION("a deletion: a missing folder is done, a status error deletes nothing") {
+    const fs::path root = Slot::FreshRoot();
+    CHECK(DeleteImportFolder(root / "absent", "x") == 0);
+    PutFile(root / "f" / "a", Content(1));
+    PutFile(root / "f" / "txn", Content(2));
+    g_hook.fail_at = "x.stat";
+    g_hook.fail_code = ERROR_ACCESS_DENIED;
+    CHECK(DeleteImportFolder(root / "f", "x") == ERROR_ACCESS_DENIED);
+    CHECK(fs::exists(root / "f" / "a"));
+    CHECK(fs::exists(root / "f" / "txn"));
+    RemoveRoot(root);
+  }
+}
+
+TEST_CASE("a listing that fails partway keeps every folder", "[save_import][errors]") {
+  HookGuard hook;
+  SECTION("a deletion returns the error and deletes nothing") {
+    const fs::path root = Slot::FreshRoot();
+    PutFile(root / "f" / "a", Content(1));
+    PutFile(root / "f" / "b", Content(1));
+    PutFile(root / "f" / "txn", Content(2));
+    int entries = 0;
+    g_hook.fail_code = ERROR_IO_DEVICE;
+    g_hook.on_point = [&](const char* p) {
+      if (std::strcmp(p, "x.enum") == 0 && ++entries == 2) g_hook.fail_at = "x.enum";
+    };
+    CHECK(DeleteImportFolder(root / "f", "x") == ERROR_IO_DEVICE);
+    CHECK(fs::exists(root / "f" / "a"));
+    CHECK(fs::exists(root / "f" / "b"));
+    CHECK(fs::exists(root / "f" / "txn"));
+    RemoveRoot(root);
+  }
+  SECTION("recovery settles nothing and refuses every import") {
+    Slot slot;
+    PutFile(slot.ImportDir() / "old.xsg", Content(1));  // no record: would be discarded
+    g_hook.fail_at = "recover.enum";
+    g_hook.fail_code = ERROR_ACCESS_DENIED;
+    {
+      ContentManager cm(nullptr, slot.root);  // must not throw
+      CHECK(fs::exists(slot.ImportDir() / "old.xsg"));
+      ImportReport r;
+      CHECK(slot.Import(cm, Content(2), 1, &r) != X_ERROR_SUCCESS);
+      CHECK(r.reason == "recovery incomplete");
+      CHECK(GetFile(slot.live) == Content(1));
+      CHECK(GetFile(slot.header) == slot.header_bytes);
+    }
+    ExpectSettled(slot, Content(1));  // the next start lists it and discards it
+    RemoveRoot(slot.root);
+  }
+}
+
 // ---- Recovery's orphans: the live file never written --------------------------------------------
 
 TEST_CASE("recovery orphans a damaged record or a third live file", "[save_import][recovery]") {

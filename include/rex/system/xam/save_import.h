@@ -50,8 +50,10 @@ uint32_t ReadWholeFile(const std::filesystem::path& path, std::vector<uint8_t>* 
 // The hook is called at each named point of the import and of recovery. 0 continues; a non-zero
 // Win32 error makes the operation at that point fail with it (where the point names an operation:
 // a durable write's `.partial` and `.tmp`, a deletion's `.first` and `.txn`, `install`, `readback`
-// (any non-zero is a mismatch), `prev.rename`, `volume` (any non-zero: not NTFS)); at the I- and
-// R-points the value is ignored. The hook may end the process (TerminateProcess) or change files
+// (any non-zero is a mismatch), `prev.rename`, `volume` (any non-zero: not NTFS)); the status
+// queries `stat.pending`, `stat.import`, `stat.txn` and a deletion's `.stat`, and the folder
+// listings `recover.enum` and a deletion's `.enum` (at each entry), fail with the value as their
+// error; at the I- and R-points the value is ignored. The hook may end the process (TerminateProcess) or change files
 // first. Without a hook every point is one relaxed load.
 using ImportFaultHook = uint32_t (*)(const char* point);
 void SetImportFaultHook(ImportFaultHook hook);
@@ -83,7 +85,8 @@ uint32_t DurableWrite(const std::filesystem::path& path, std::span<const uint8_t
                       const Sha256& expected, const std::string& name, const char* alias = nullptr);
 // Deletes one of the import's own folders (files only): every file but `txn` in turn (point
 // <op>.first after the first), then point <op>.txn, then `txn`, then the empty folder. A missing
-// folder is success. A Win32 error, 0 on success.
+// folder is success; a folder whose status or listing fails is an error with nothing deleted.
+// A Win32 error, 0 on success.
 uint32_t DeleteImportFolder(const std::filesystem::path& dir, const std::string& op);
 
 // ---- The journal --------------------------------------------------------------------------------
@@ -120,7 +123,9 @@ class SaveImportJournal {
   // Settles every save-backup/import/<id>/ by the live file's hash against its record: finished
   // (live = new: moved to previous-import/<id>), did not happen (live = old, or no record:
   // deleted), or orphaned (anything else: moved to import-orphaned/<id>-<time>). Never writes the
-  // live file or the header. Each outcome is one delete or one rename after the decision.
+  // live file or the header. Each outcome is one delete or one rename after the decision. A record
+  // whose status cannot be read keeps its folder and refuses its package; a listing that fails
+  // keeps every folder and refuses every import for the process. Never throws.
   void Recover();
 
   bool IsUnresolved(const std::string& id) const;
@@ -135,11 +140,14 @@ class SaveImportJournal {
   uint32_t FinishCommitted(const std::string& id, const char* op);
   X_RESULT Abort(const std::string& id, X_RESULT result, const std::string& reason,
                  ImportReport* report);
+  void RecoverLocked();  // Recover's body, the lock held
 
   std::filesystem::path root_;
   mutable std::mutex mutex_;
-  std::unordered_set<std::string> unresolved_;  // X_ERROR_IO_INCOMPLETE in this process
+  // X_ERROR_IO_INCOMPLETE in this process, or a folder recovery kept (its record unreadable).
+  std::unordered_set<std::string> unresolved_;
   std::unordered_set<std::string> orphaned_;    // orphaned by this process's recovery
+  bool recovery_incomplete_ = false;            // recovery could not list or finish: refuse all
 };
 
 // ---- The commit counter -------------------------------------------------------------------------
