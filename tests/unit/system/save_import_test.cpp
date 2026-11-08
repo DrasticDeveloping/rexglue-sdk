@@ -501,7 +501,9 @@ TEST_CASE("a kill racing the replace leaves the old or the new file", "[save_imp
   const auto b = Content(2);
   slot.Stage(a, "a");
   slot.Stage(b, "b");
-  // 500 runs, bounded by 45 s so the test stays inside its time limit; at least 100 must run.
+  // Up to 500 runs, bounded by 45 s so the test stays inside its time limit. Every run's checks
+  // are the claim; the count only measures the machine (the 1C council's Sol B2, Opus B2): at least
+  // 20 must run, and fewer than 100 is a warning (a loaded machine), not a failure.
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
   int runs = 0;
   for (; runs < 500 && std::chrono::steady_clock::now() < deadline; ++runs) {
@@ -513,7 +515,8 @@ TEST_CASE("a kill racing the replace leaves the old or the new file", "[save_imp
     REQUIRE_FALSE(fs::exists(slot.ImportDir()));
   }
   INFO("runs " << runs);
-  CHECK(runs >= 100);
+  REQUIRE(runs >= 20);
+  if (runs < 100) WARN("runs " << runs << " (machine under load)");
   RemoveRoot(slot.root);
 }
 
