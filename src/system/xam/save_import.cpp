@@ -327,9 +327,27 @@ uint32_t DurableWrite(const std::filesystem::path& path, std::span<const uint8_t
     DeleteFileW(tmp.c_str());
     return err ? err : kErrMismatch;
   };
-  HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+  // A fresh temp file every time (Sol 1C N1): CREATE_ALWAYS would truncate and write through
+  // whatever already sits at the temp name, a hard link to another file included (that file then
+  // takes the bytes). So the name is first removed (DeleteFileW removes that folder entry only; a
+  // hard-linked partner keeps its bytes), then the temp is created with CREATE_NEW, which never
+  // opens an existing file (a name planted again in between makes it fail with ERROR_FILE_EXISTS),
+  // and a temp with a second hard link after the open is refused before anything is written.
+  if (!DeleteFileW(tmp.c_str())) {
+    const DWORD err = GetLastError();
+    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) return fail(err);
+  }
+  HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
                          FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE) return fail(GetLastError());
+  {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(h, &info) || info.nNumberOfLinks != 1) {
+      const uint32_t err = info.nNumberOfLinks > 1 ? ERROR_ACCESS_DENIED : GetLastError();
+      CloseHandle(h);
+      return fail(err);
+    }
+  }
   const size_t half = bytes.size() / 2;
   if (!WriteAll(h, bytes.data(), half)) {
     const uint32_t err = GetLastError();

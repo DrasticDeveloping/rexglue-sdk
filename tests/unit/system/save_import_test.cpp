@@ -1001,6 +1001,45 @@ TEST_CASE("the snapshot refuses when a journal folder's status is uncertain", "[
   RemoveRoot(slot.root);
 }
 
+// Sol 1C N1: a hard link planted at a durable write's temp name (here to a stand-in for the owner's
+// save, made with CreateHardLinkW in a fresh temp folder) is never written through. The write
+// removes the link's name, creates its temp new and moves it into place; the stand-in keeps its
+// bytes, after a full write and after one failed at <name>.partial (half written) alike.
+TEST_CASE("a durable write never writes through a hard link at its temp name", "[save_import][errors]") {
+  HookGuard hook;
+  const fs::path dir = Slot::FreshRoot();
+  const fs::path stand_in = dir / "owner" / "SWAPFORCE_1.xsg";
+  const auto stand_bytes = Content(3);
+  PutFile(stand_in, stand_bytes);
+  const fs::path target = dir / "copy" / "SWAPFORCE_1.xsg";
+  fs::create_directories(target.parent_path());
+  fs::path tmp = target;
+  tmp += L".tmp";
+  const auto bytes = Content(4);
+
+  SECTION("a full write") {
+    REQUIRE(CreateHardLinkW(tmp.c_str(), stand_in.c_str(), nullptr));
+    CHECK(DurableWrite(target, bytes, ShaOf(bytes), "staged") == 0);
+    CHECK(GetFile(target) == bytes);
+    CHECK_FALSE(fs::exists(tmp));
+  }
+  SECTION("a write failed at its .partial point") {
+    REQUIRE(CreateHardLinkW(tmp.c_str(), stand_in.c_str(), nullptr));
+    g_hook.fail_at = "staged.partial";
+    g_hook.fail_code = ERROR_DISK_FULL;
+    CHECK(DurableWrite(target, bytes, ShaOf(bytes), "staged") == uint32_t(ERROR_DISK_FULL));
+    CHECK_FALSE(fs::exists(target));
+    CHECK_FALSE(fs::exists(tmp));
+  }
+  SECTION("a hard link at the destination itself is replaced, not written through") {
+    REQUIRE(CreateHardLinkW(target.c_str(), stand_in.c_str(), nullptr));
+    CHECK(DurableWrite(target, bytes, ShaOf(bytes), "staged") == 0);
+    CHECK(GetFile(target) == bytes);
+  }
+  CHECK(GetFile(stand_in) == stand_bytes);
+  RemoveRoot(dir);
+}
+
 TEST_CASE("the commit counter counts per package and records the raising thread", "[save_import][snapshot]") {
   CommitCounter counter;
   CHECK(counter.Current("a") == 0);

@@ -78,10 +78,12 @@ std::string FormatImportTxn(const ImportTxn& txn);
 bool ParseImportTxn(std::string_view text, ImportTxn* out);
 
 // ---- Building blocks (exposed for the tests) ---------------------------------------------------
-// A durable write of `bytes` to `path`: path.tmp created, written (point <name>.partial after half),
-// flushed, closed, reopened and hashed against `expected` (point <name>.tmp; `alias` too when not
-// null), then MoveFileExW(tmp, path, REPLACE_EXISTING | WRITE_THROUGH). Any failure deletes the
-// temp and returns its Win32 error; the destination is unchanged.
+// A durable write of `bytes` to `path`: whatever sits at path.tmp removed by name (DeleteFileW: a
+// hard link's partner keeps its bytes), path.tmp created new (CREATE_NEW, refused when it has a
+// second hard link), written (point <name>.partial after half), flushed, closed, reopened and
+// hashed against `expected` (point <name>.tmp; `alias` too when not null), then MoveFileExW(tmp,
+// path, REPLACE_EXISTING | WRITE_THROUGH). Any failure deletes the temp's name and returns its
+// Win32 error; the destination is unchanged, and no other file is ever written through the temp.
 uint32_t DurableWrite(const std::filesystem::path& path, std::span<const uint8_t> bytes,
                       const Sha256& expected, const std::string& name, const char* alias = nullptr);
 // Deletes one of the import's own folders (files only): every file but `txn` in turn (point
