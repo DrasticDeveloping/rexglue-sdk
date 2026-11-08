@@ -833,9 +833,9 @@ X_RESULT ContentManager::SnapshotSavedGame(uint64_t xuid, const XCONTENT_AGGREGA
   const auto package_dir = ResolvePackagePath(xuid, data);
   const std::string id = PackageIdOfPath(package_dir);
   auto global_lock = global_critical_region_.Acquire();
-  std::error_code ec;
-  if (IsSavedGameOpenLocked(data) || std::filesystem::exists(import_journal_.PendingDir(id), ec) ||
-      std::filesystem::exists(import_journal_.ImportDir(id), ec)) {
+  // A pending or import folder whose status cannot be established refuses as one that exists
+  // (Sol 1C round 2): never taken for absent (SaveImportJournal::FoldersAbsent).
+  if (IsSavedGameOpenLocked(data) || !import_journal_.FoldersAbsent(id)) {
     return X_ERROR_ACCESS_DENIED;
   }
   std::vector<uint8_t> read;

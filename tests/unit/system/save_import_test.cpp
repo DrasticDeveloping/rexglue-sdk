@@ -976,6 +976,31 @@ TEST_CASE("the snapshot refuses while a journal folder exists or the size is wro
   RemoveRoot(slot.root);
 }
 
+TEST_CASE("the snapshot refuses when a journal folder's status is uncertain", "[save_import][snapshot]") {
+  HookGuard hook;
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  XCONTENT_AGGREGATE_DATA data{};
+  std::memcpy(&data, slot.header_bytes.data(), sizeof(data));
+  std::vector<uint8_t> bytes;
+  uint64_t count = 0;
+  for (const char* point : {"snap.pending", "snap.import"}) {
+    g_hook.fail_at = point;  // the status query fails once (not a plain not-found)
+    g_hook.fail_code = ERROR_ACCESS_DENIED;
+    CHECK(cm.SnapshotSavedGame(kXuid, data, "SWAPFORCE_1.xsg", kSize, &bytes, &count) ==
+          X_ERROR_ACCESS_DENIED);
+    CHECK(g_hook.fail_at.empty());  // it was reached
+    CHECK(cm.SnapshotSavedGame(kXuid, data, "SWAPFORCE_1.xsg", kSize, &bytes, &count) == X_ERROR_SUCCESS);
+  }
+  // A file where a folder belongs is not an absent folder either.
+  PutFile(slot.root / "save-backup" / "pending" / kId, {1});
+  CHECK(cm.SnapshotSavedGame(kXuid, data, "SWAPFORCE_1.xsg", kSize, &bytes, &count) ==
+        X_ERROR_ACCESS_DENIED);
+  fs::remove(slot.root / "save-backup" / "pending" / kId);
+  CHECK(cm.SnapshotSavedGame(kXuid, data, "SWAPFORCE_1.xsg", kSize, &bytes, &count) == X_ERROR_SUCCESS);
+  RemoveRoot(slot.root);
+}
+
 TEST_CASE("the commit counter counts per package and records the raising thread", "[save_import][snapshot]") {
   CommitCounter counter;
   CHECK(counter.Current("a") == 0);

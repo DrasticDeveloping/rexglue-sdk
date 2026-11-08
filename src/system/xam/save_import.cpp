@@ -413,6 +413,11 @@ bool SaveImportJournal::IsUnresolved(const std::string& id) const {
   return unresolved_.count(id) != 0;
 }
 
+bool SaveImportJournal::FoldersAbsent(const std::string& id) const {
+  return StatusOf(PendingDir(id), "snap.pending") == PathState::kMissing &&
+         StatusOf(ImportDir(id), "snap.import") == PathState::kMissing;
+}
+
 uint32_t SaveImportJournal::FinishCommitted(const std::string& id, const char* op) {
   if (uint32_t err = DeleteImportFolder(PreviousDir(id), op)) return err;
   const bool recovery = std::string_view(op) == "prev-r";

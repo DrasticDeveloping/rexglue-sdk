@@ -51,7 +51,8 @@ uint32_t ReadWholeFile(const std::filesystem::path& path, std::vector<uint8_t>* 
 // Win32 error makes the operation at that point fail with it (where the point names an operation:
 // a durable write's `.partial` and `.tmp`, a deletion's `.first` and `.txn`, `install`, `readback`
 // (any non-zero is a mismatch), `prev.rename`, `volume` (any non-zero: not NTFS)); the status
-// queries `stat.pending`, `stat.import`, `stat.txn` and a deletion's `.stat`, and the folder
+// queries `stat.pending`, `stat.import`, `stat.txn`, a deletion's `.stat` and the snapshot's
+// `snap.pending` and `snap.import`, and the folder
 // listings `recover.enum` and a deletion's `.enum` (at each entry), fail with the value as their
 // error; at the I- and R-points the value is ignored. The hook may end the process (TerminateProcess) or change files
 // first. Without a hook every point is one relaxed load.
@@ -129,6 +130,12 @@ class SaveImportJournal {
   void Recover();
 
   bool IsUnresolved(const std::string& id) const;
+
+  // Whether neither the native journal's pending folder nor this journal's import folder exists
+  // for `id`, each established by its own status query (points `snap.pending`, `snap.import`).
+  // Only a plain not-found counts as absent; a status that cannot be read (or anything else at
+  // the path) counts as present, so ContentManager::SnapshotSavedGame refuses then.
+  bool FoldersAbsent(const std::string& id) const;
 
   std::filesystem::path ImportDir(const std::string& id) const;
   std::filesystem::path PreviousDir(const std::string& id) const;
