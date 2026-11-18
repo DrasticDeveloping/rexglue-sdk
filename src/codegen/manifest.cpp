@@ -190,7 +190,9 @@ bool LineSetsKey(std::string_view line, std::string_view key) {
 
 bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
                                           std::string_view version) {
-  std::ifstream in(path);
+  // Binary, and each line's CR dropped here: the stamped manifest has LF line ends on every
+  // platform (a text-mode read drops the CR only on Windows).
+  std::ifstream in(path, std::ios::binary);
   if (!in) {
     REXLOG_ERROR("Failed to open manifest for stamping: {}", path.string());
     return false;
@@ -198,6 +200,8 @@ bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
   std::vector<std::string> lines;
   std::string buf;
   while (std::getline(in, buf)) {
+    if (!buf.empty() && buf.back() == '\r')
+      buf.pop_back();
     lines.push_back(std::move(buf));
     buf.clear();
   }
