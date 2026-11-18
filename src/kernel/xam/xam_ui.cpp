@@ -17,8 +17,16 @@
 
 #include <imgui.h>
 
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <fmt/format.h>
+
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
+#include <rex/kernel/xam/headless_answers.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -53,6 +61,49 @@ using namespace rex::system;
 // to create a listener (if they're insane enough do this).
 
 extern std::atomic<int> xam_dialogs_shown_;
+
+// The answers given with no UI (headless_answers.h): logged at warning level, counted, the last one
+// kept. A process nobody looks at (a dedicated server) can say afterwards what it answered.
+namespace {
+std::atomic<uint32_t> g_headless_answers{0};
+std::mutex g_headless_last_mutex;
+std::string g_headless_last;  // under g_headless_last_mutex
+
+void NoteHeadlessAnswer(std::string what) {
+  for (char& c : what) {
+    if (c == '\n' || c == '\r') c = ' ';
+  }
+  REXKRNL_WARN("XAM: headless answer: {}", what);
+  g_headless_answers.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(g_headless_last_mutex);
+  g_headless_last = std::move(what);
+}
+
+std::string ButtonList(const std::vector<std::string>& buttons) {
+  std::string out;
+  for (size_t i = 0; i < buttons.size(); ++i) {
+    out += (i ? "|" : "") + buttons[i];
+  }
+  return out;
+}
+
+std::string MessageBoxAnswer(const std::string& title, const std::string& text,
+                             const std::vector<std::string>& buttons, uint32_t active_button) {
+  const std::string chosen =
+      active_button < buttons.size() ? buttons[active_button] : std::string("(no such button)");
+  return fmt::format("message box \"{}\": \"{}\" buttons [{}] focus {}: answered {} (\"{}\")",
+                     title, text, ButtonList(buttons), active_button, active_button, chosen);
+}
+}  // namespace
+
+uint32_t HeadlessAnswerCount() {
+  return g_headless_answers.load(std::memory_order_relaxed);
+}
+
+std::string LastHeadlessAnswer() {
+  std::lock_guard<std::mutex> lock(g_headless_last_mutex);
+  return g_headless_last;
+}
 
 class XamDialog : public rex::ui::ImGuiDialog {
  public:
@@ -296,6 +347,7 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
     // Auto-pick the focused button.
+    NoteHeadlessAnswer(MessageBoxAnswer(title, text_str, buttons, uint32_t(active_button)));
     auto run = [result_ptr, active_button]() -> X_RESULT {
       *result_ptr = static_cast<uint32_t>(active_button);
       return X_ERROR_SUCCESS;
@@ -329,6 +381,7 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
           overlapped.guest_address());
     } else {
       // Fallback to headless if no drawer available
+      NoteHeadlessAnswer(MessageBoxAnswer(title, text_str, buttons, uint32_t(active_button)));
       auto run = [result_ptr, active_button]() -> X_RESULT {
         *result_ptr = static_cast<uint32_t>(active_button);
         return X_ERROR_SUCCESS;
@@ -433,8 +486,27 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
 
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
 
+  // Read and convert title/description/default_text from guest memory as utf16 to utf8 strings
+  // (for the dialog, and for the headless answer's line).
+  std::string title_str = title
+                              ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
+                                    REX_KERNEL_MEMORY()->TranslateVirtual(title.guest_address())))
+                              : "";
+  std::string desc_str =
+      description ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
+                        REX_KERNEL_MEMORY()->TranslateVirtual(description.guest_address())))
+                  : "";
+  std::string def_text_str =
+      default_text ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
+                         REX_KERNEL_MEMORY()->TranslateVirtual(default_text.guest_address())))
+                   : "";
+  const std::string keyboard_answer =
+      fmt::format("keyboard \"{}\" (\"{}\"): answered with its default text \"{}\"", title_str,
+                  desc_str, def_text_str);
+
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
+    NoteHeadlessAnswer(keyboard_answer);
     auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
       // Redirect default_text back into the buffer.
       if (!default_text) {
@@ -464,20 +536,6 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
     const Runtime* emulator = REX_KERNEL_STATE()->emulator();
     ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
 
-    // Read and convert title/description/default_text from guest memory as utf16 to utf8 strings
-    std::string title_str = title
-                                ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
-                                      REX_KERNEL_MEMORY()->TranslateVirtual(title.guest_address())))
-                                : "";
-    std::string desc_str =
-        description ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
-                          REX_KERNEL_MEMORY()->TranslateVirtual(description.guest_address())))
-                    : "";
-    std::string def_text_str =
-        default_text ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
-                           REX_KERNEL_MEMORY()->TranslateVirtual(default_text.guest_address())))
-                     : "";
-
     if (imgui_drawer) {
       uint32_t buffer_length_safe = buffer_length + 1;  // +1 for null terminator, just in case
       result = xeXamDispatchDialogEx<KeyboardInputDialog>(
@@ -486,6 +544,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
           close, overlapped.guest_address());
     } else {
       // Fallback to headless
+      NoteHeadlessAnswer(keyboard_answer);
       auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
         if (!default_text) {
           std::memset(buffer, 0, buffer_size);
@@ -541,6 +600,7 @@ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
   // Synchronous logging: the arm does nothing and the flush is a plain one.
   ::rex::ArmExitWatchdog();
   if (!imgui_drawer) {
+    NoteHeadlessAnswer("dirty disc error \"Disc Read Error\": no UI to show it; the title ends (exit 1)");
     // No UI available - log prominently and pause to let user see the error
     REXKRNL_ERROR("===========================================");
     REXKRNL_ERROR("FATAL: Disc Read Error (no UI to display)");
