@@ -74,9 +74,12 @@ void NoteHeadlessAnswer(std::string what) {
     if (c == '\n' || c == '\r') c = ' ';
   }
   REXKRNL_WARN("XAM: headless answer: {}", what);
-  g_headless_answers.fetch_add(1, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> lock(g_headless_last_mutex);
-  g_headless_last = std::move(what);
+  // The last answer first, then the count: whoever sees the count above zero finds its answer.
+  {
+    std::lock_guard<std::mutex> lock(g_headless_last_mutex);
+    g_headless_last = std::move(what);
+  }
+  g_headless_answers.fetch_add(1, std::memory_order_release);
 }
 
 std::string ButtonList(const std::vector<std::string>& buttons) {
@@ -97,7 +100,7 @@ std::string MessageBoxAnswer(const std::string& title, const std::string& text,
 }  // namespace
 
 uint32_t HeadlessAnswerCount() {
-  return g_headless_answers.load(std::memory_order_relaxed);
+  return g_headless_answers.load(std::memory_order_acquire);
 }
 
 std::string LastHeadlessAnswer() {
