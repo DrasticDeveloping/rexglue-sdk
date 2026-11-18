@@ -11,12 +11,30 @@
 #endif
 #include <windows.h>
 
+#include <atomic>
+
 #include <rex/string.h>
 #include <rex/system.h>
 
 namespace rex {
 
+namespace {
+std::atomic<bool> g_message_boxes_suppressed{false};
+}  // namespace
+
+void SetSimpleMessageBoxesSuppressed(bool suppressed) {
+  g_message_boxes_suppressed.store(suppressed, std::memory_order_relaxed);
+}
+
+bool SimpleMessageBoxesSuppressed() {
+  return g_message_boxes_suppressed.load(std::memory_order_relaxed);
+}
+
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
+  // A dedicated server: no modal box nobody would close (the caller has logged the message).
+  if (SimpleMessageBoxesSuppressed()) {
+    return;
+  }
   UINT flags = MB_OK | MB_TOPMOST | MB_SETFOREGROUND;
   const wchar_t* title = L"ReXGlue";
   switch (type) {

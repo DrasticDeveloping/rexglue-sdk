@@ -34,7 +34,13 @@ enum class SimpleMessageBoxType {
   Error,
 };
 
-// This is expected to block the caller until the message box is closed.
+// This is expected to block the caller until the message box is closed. Suppressed (below), it
+// shows nothing and returns at once; every caller logs the message itself.
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message);
+
+// For a process nobody sits at (a dedicated server): ShowSimpleMessageBox shows no box, so a
+// fatal path logs and exits instead of blocking on a modal box. Any thread; set it early.
+void SetSimpleMessageBoxesSuppressed(bool suppressed);
+bool SimpleMessageBoxesSuppressed();
 
 }  // namespace rex
