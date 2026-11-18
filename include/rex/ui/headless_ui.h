@@ -5,8 +5,8 @@
 // painted that UI on the UI thread for nobody. With render_hidden_ui=false a hidden window gets
 // none of them: ReXApp::SetupPresentation creates the window (input, the clipboard owner and
 // WM_CLOSE still need it) but no presenter surface, no immediate or ImGui drawer and no dialogs,
-// and Runtime::Setup sets the graphics system up without presentation (its headless provider; the
-// command processor is the same). What tolerates their absence:
+// and Runtime::Setup sets the graphics system up without presentation (RuntimeConfig::presentation;
+// its headless provider, the command processor is the same). What tolerates their absence:
 // - the guest's XAM dialogs take the headless path (no ImGui drawer: xam_ui.cpp), so a dialog
 //   never waits for a paint that never comes; the app may also set `headless` for the same;
 // - a swap without a presenter closes its frame like the draw skip does (d3d12/command_processor
@@ -14,8 +14,9 @@
 // - the app's own drawers are null (OnCreateDialogs is not called): its dialogs are never made.
 // A visible window always gets its UI: the switch acts on a hidden window only.
 //
-// Decided once, before the window opens, after the app's OnPreSetup (which may set window_hidden
-// and render_hidden_ui): both settings are restart-only. Pure, so a unit test covers it.
+// Decided once by ReXApp, before the window opens, after the app's OnPreSetup (which may set
+// window_hidden and render_hidden_ui): both settings are restart-only. Runtime::Setup takes the
+// decision from RuntimeConfig::presentation instead of deciding again.
 
 #pragma once
 

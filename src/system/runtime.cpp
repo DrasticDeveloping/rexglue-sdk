@@ -27,10 +27,6 @@
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
-#include <rex/ui/headless_ui.h>
-
-REXCVAR_DECLARE(bool, render_hidden_ui);  // ui/window.cpp
-REXCVAR_DECLARE(bool, window_hidden);     // ui/window.cpp
 
 REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
 REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
@@ -185,11 +181,9 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   // Initialize GPU from injected config
   if (config.graphics) {
     graphics_system_ = std::move(config.graphics);
-    // A hidden window with render_hidden_ui off (rex/ui/headless_ui.h) has no presenter: ReXApp
-    // did not set presentation up, and this must not either, or the presenter would come back.
-    bool with_presentation =
-        (app_context_ != nullptr) &&
-        !ui::headless_ui::Decide(REXCVAR_GET(render_hidden_ui), REXCVAR_GET(window_hidden));
+    // ReXApp's headless window (config.presentation false, rex/ui/headless_ui.h) has no
+    // presenter: ReXApp did not set presentation up, and this must not either.
+    bool with_presentation = (app_context_ != nullptr) && config.presentation;
     X_STATUS gpu_status = graphics_system_->Setup(function_dispatcher_.get(), kernel_state_.get(),
                                                   app_context_, with_presentation);
     if (XFAILED(gpu_status)) {

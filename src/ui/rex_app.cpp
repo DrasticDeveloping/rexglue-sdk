@@ -343,6 +343,9 @@ bool ReXApp::SetupPresentation() {
         "UI paint");
   }
 
+  // Runtime::Setup sets presentation up itself when an app context is set: told not to here.
+  config_.presentation = !headless_ui_;
+
   if (config_.graphics && !headless_ui_) {
     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
     if (XFAILED(status)) {

@@ -72,6 +72,9 @@ struct RuntimeConfig {
   std::function<std::unique_ptr<system::IInputSystem>(bool tool_mode)> input_factory;
   std::function<void(Runtime*, system::KernelState*)> kernel_init;
   bool tool_mode = false;
+  // False: set the graphics system up without presentation even with an app context (ReXApp's
+  // headless window, rex/ui/headless_ui.h: no presenter, swap chain or UI).
+  bool presentation = true;
 };
 
 /// Helper macros for populating RuntimeConfig with concrete backends.
