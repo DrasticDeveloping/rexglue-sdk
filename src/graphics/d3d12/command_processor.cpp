@@ -2057,7 +2057,17 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     return;
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
-    REXGPU_ERROR("IssueSwap: presenter is null");
+    // No presenter: a headless hidden window (render_hidden_ui off, rex/ui/headless_ui.h) whose
+    // draw skip is off or refused. Nothing to present to, so the frame is closed as the skip
+    // closes it (above), instead of an error every frame and a frame left open. Said once.
+    static bool no_presenter_logged = false;  // the command processor thread only
+    if (!no_presenter_logged) {
+      no_presenter_logged = true;
+      REXGPU_WARN("IssueSwap: no presenter (headless window); frames are closed, not presented");
+    }
+    if (BeginSubmission(true)) {
+      EndSubmission(true);
+    }
     return;
   }
 

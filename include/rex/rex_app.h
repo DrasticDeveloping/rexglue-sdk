@@ -250,6 +250,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   ui::Window* window() const { return window_.get(); }
   ui::ImGuiDrawer* imgui_drawer() const { return imgui_drawer_.get(); }
   ui::ImmediateDrawer* immediate_drawer() const { return immediate_drawer_.get(); }
+  /// True when this process has no presenter, swap chain, drawers or UI (a hidden window with
+  /// render_hidden_ui off, rex/ui/headless_ui.h); decided in SetupPresentation after OnPreSetup.
+  /// Then imgui_drawer() and immediate_drawer() are null and OnCreateDialogs is never called.
+  bool headless_ui() const { return headless_ui_; }
   system::AchievementManager& achievements() const;
 
   const std::filesystem::path& game_data_root() const { return game_data_root_; }
@@ -300,6 +304,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::atomic<bool> shutting_down_{false};
   std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
   std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
+  bool headless_ui_ = false;  // headless_ui()
 
   // Built-in overlays
   std::shared_ptr<LogCaptureSink> log_sink_;

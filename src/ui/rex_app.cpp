@@ -36,6 +36,7 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
+#include <rex/ui/headless_ui.h>
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
 
@@ -45,6 +46,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <string_view>
+
+REXCVAR_DECLARE(bool, render_hidden_ui);  // ui/window.cpp
+REXCVAR_DECLARE(bool, window_hidden);     // ui/window.cpp
 
 REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
@@ -330,7 +334,16 @@ bool ReXApp::SetupPresentation() {
     }
   }
 
-  if (config_.graphics) {
+  // A hidden window with render_hidden_ui off (rex/ui/headless_ui.h): after OnPreSetup, which may
+  // set either. No presenter (here or in Runtime::Setup), no drawers, no dialogs, no overlay binds.
+  headless_ui_ = ui::headless_ui::Decide(REXCVAR_GET(render_hidden_ui), REXCVAR_GET(window_hidden));
+  if (headless_ui_) {
+    REXLOG_INFO(
+        "UI: headless (hidden window, render_hidden_ui off): no presenter, swap chain, drawers or "
+        "UI paint");
+  }
+
+  if (config_.graphics && !headless_ui_) {
     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
     if (XFAILED(status)) {
       REXLOG_ERROR("Graphics presentation setup failed: {:08X}", status);
@@ -361,6 +374,11 @@ bool ReXApp::SetupPresentation() {
     }
   });
   window_->Open();
+
+  // Headless: the window stays (input drivers, the clipboard owner, WM_CLOSE), nothing paints it.
+  if (headless_ui_) {
+    return true;
+  }
 
   auto* graphics_system = config_.graphics.get();
   if (graphics_system && graphics_system->presenter()) {

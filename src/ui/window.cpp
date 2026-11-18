@@ -42,6 +42,14 @@ REXCVAR_DEFINE_BOOL(window_hidden, false, "UI/Window",
                     "Never show the window (for runs that only write files, e.g. a launcher's export)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// A hidden window's presenter, swap chain and UI (rex/ui/headless_ui.h): on (the default) a hidden
+// window still gets them; off (a dedicated server) it gets none. Acts on a hidden window only.
+REXCVAR_DEFINE_BOOL(render_hidden_ui, true, "UI/Window",
+                    "With the window hidden (window_hidden), still create the presenter, its swap "
+                    "chain and the UI (dialogs, menus, overlays). Off (a dedicated server): none of "
+                    "them, and the guest's dialogs take their default answer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")
