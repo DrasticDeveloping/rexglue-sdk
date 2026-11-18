@@ -12,6 +12,8 @@
 #include <rex/codegen/output_stamp.h>
 
 #include <fstream>
+#include <iterator>
+#include <optional>
 
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
@@ -64,9 +66,32 @@ std::string OutputStamp::Serialize() const {
   return doc.dump(2) + "\n";
 }
 
+namespace {
+
+// The file's bytes with each CR LF read as LF; nullopt when unreadable.
+std::optional<std::string> ReadWithLfLineEnds(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    return std::nullopt;
+  std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (in.bad())
+    return std::nullopt;
+  std::string out;
+  out.reserve(raw.size());
+  for (size_t i = 0; i < raw.size(); ++i) {
+    if (raw[i] == '\r' && i + 1 < raw.size() && raw[i + 1] == '\n')
+      continue;
+    out += raw[i];
+  }
+  return out;
+}
+
+}  // namespace
+
 std::string ComputeInputFingerprint(std::span<const std::filesystem::path> inputFiles,
                                     std::string_view sdkVersion,
-                                    std::span<const std::string> flagValues) {
+                                    std::span<const std::string> flagValues,
+                                    const std::filesystem::path& selfWritten) {
   std::string accumulator;
   accumulator += "sdk=";
   accumulator += sdkVersion;
@@ -83,7 +108,13 @@ std::string ComputeInputFingerprint(std::span<const std::filesystem::path> input
     std::error_code ec;
     std::string digest = "<missing>";
     if (std::filesystem::exists(path, ec)) {
-      digest = rex::hash_file(path);
+      if (!selfWritten.empty() && path == selfWritten) {
+        // The same digest as hash_file for a file whose line ends are LF already.
+        auto text = ReadWithLfLineEnds(path);
+        digest = text ? rex::hash_bytes(*text) : std::string{};
+      } else {
+        digest = rex::hash_file(path);
+      }
       if (digest.empty()) {
         // Weaker than content, but a constant here would report a locked input
         // as unchanged and skip the module forever.
