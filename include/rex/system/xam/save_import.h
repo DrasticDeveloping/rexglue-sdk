@@ -18,9 +18,11 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -112,6 +114,10 @@ class SaveImportJournal {
     Sha256 base_sha{};
     uint32_t seq = 0;
     uint64_t file_size = 0;               // the exact length both files must have
+    // Swap Force Online online_save_to_host (design draft 5, sec. 8): the header's hash the caller
+    // bound; with `check_header` a header of any other hash refuses in step 0 ("header differs").
+    Sha256 base_header_sha{};
+    bool check_header = false;
   };
   // Runs `body` with the content manager's lock held; `body` gets whether the package is open.
   using LockedRunner = std::function<uint32_t(const std::function<uint32_t(bool open)>& body)>;
@@ -157,6 +163,28 @@ class SaveImportJournal {
   std::unordered_set<std::string> unresolved_;
   std::unordered_set<std::string> orphaned_;    // orphaned by this process's recovery
   bool recovery_incomplete_ = false;            // recovery could not list or finish: refuse all
+};
+
+// ---- The slot write lock (Swap Force Online online_save_to_host, design draft 5 sec. 8) ------------
+// A cross-process lock on one saved-game package: the file <content root>\save-backup\locks\<id>.lock
+// opened with no sharing and delete-on-close, so it belongs to the handle (not to a thread: the native
+// save takes it in XamContentCreate and gives it back in CloseContent, possibly on another thread) and
+// ends with the process. Every writer of this build takes it: the native saved-game write, the import
+// and the import recovery. A writer of another build or program does not (uncooperative); the import
+// detects such a write at its last moment instead (the displaced check, SaveImportJournal::Import).
+class SlotWriteLock {
+ public:
+  // The lock, waiting up to `wait` for another holder; nullptr when it was not obtained (held
+  // elsewhere for the whole wait, or the file could not be made). Not supported off Windows: nullptr.
+  static std::unique_ptr<SlotWriteLock> Acquire(const std::filesystem::path& content_root, const std::string& id,
+                                                std::chrono::milliseconds wait);
+  ~SlotWriteLock();
+  SlotWriteLock(const SlotWriteLock&) = delete;
+  SlotWriteLock& operator=(const SlotWriteLock&) = delete;
+
+ private:
+  explicit SlotWriteLock(void* handle) : handle_(handle) {}
+  void* handle_ = nullptr;
 };
 
 // ---- The commit counter -------------------------------------------------------------------------

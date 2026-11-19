@@ -1063,4 +1063,122 @@ TEST_CASE("the commit counter counts per package and records the raising thread"
   CHECK(counter.Current("a") == 3);
 }
 
+// ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ----------------------------
+
+TEST_CASE("the live file changed between the check and the move aside is put back and refused",
+          "[save_import][save_to_host]") {
+  HookGuard hook;
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  // An uncooperative writer lands right after step 5's hash check, before the move aside.
+  g_hook.on_point = [&](const char* p) {
+    if (std::strcmp(p, "install") == 0) PutFile(slot.live, Content(9));
+  };
+  ImportReport r;
+  CHECK(slot.Import(cm, Content(2), 1, &r) != X_ERROR_SUCCESS);
+  CHECK(r.reason == "changed at the last moment");
+  ExpectUnchanged(slot, Content(9));
+  RemoveRoot(slot.root);
+}
+
+TEST_CASE("a stop between the install's two moves puts the old file back at restart",
+          "[save_import][save_to_host][fault]") {
+  StopImportAt("displaced", /*want_new=*/false);
+}
+
+TEST_CASE("the header is bound too", "[save_import][save_to_host]") {
+  HookGuard hook;
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  SaveImportBinding b = slot.Binding();
+  b.check_header = true;
+  b.header_sha = ShaOf(slot.header_bytes);
+  const auto bytes = Content(2);
+  ImportReport r;
+  b.header_sha[0] ^= 0x01;
+  CHECK(cm.ImportSavedGame(b, slot.Stage(bytes, "h1"), ShaOf(bytes), ShaOf(Content(1)), 1, &r) != X_ERROR_SUCCESS);
+  CHECK(r.reason == "header differs");
+  ExpectUnchanged(slot, Content(1));
+  b.header_sha[0] ^= 0x01;
+  CHECK(cm.ImportSavedGame(b, slot.Stage(bytes, "h2"), ShaOf(bytes), ShaOf(Content(1)), 2, &r) == X_ERROR_SUCCESS);
+  CHECK(GetFile(slot.live) == bytes);
+  CHECK(GetFile(slot.header) == slot.header_bytes);
+  RemoveRoot(slot.root);
+}
+
+TEST_CASE("the slot write lock has one holder across handles", "[save_import][save_to_host]") {
+  const fs::path root = Slot::FreshRoot();
+  const fs::path file = root / "save-backup" / "locks" / (std::string(kId) + ".lock");
+  {
+    auto first = SlotWriteLock::Acquire(root, kId, std::chrono::milliseconds(0));
+    REQUIRE(first != nullptr);
+    CHECK(fs::exists(file));
+    const auto t0 = std::chrono::steady_clock::now();
+    auto second = SlotWriteLock::Acquire(root, kId, std::chrono::milliseconds(200));
+    CHECK(second == nullptr);
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(150));
+    auto other = SlotWriteLock::Acquire(root, "another_package", std::chrono::milliseconds(0));
+    CHECK(other != nullptr);  // another package is another lock
+  }
+  CHECK_FALSE(fs::exists(file));  // delete-on-close
+  auto again = SlotWriteLock::Acquire(root, kId, std::chrono::milliseconds(0));
+  CHECK(again != nullptr);
+  CHECK(SlotWriteLock::Acquire(root, "a/b", std::chrono::milliseconds(0)) == nullptr);  // no path in an id
+  again.reset();
+  RemoveRoot(root);
+}
+
+TEST_CASE("an import is refused while another holder has the slot write lock", "[save_import][save_to_host]") {
+  HookGuard hook;
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  auto held = SlotWriteLock::Acquire(slot.root, kId, std::chrono::milliseconds(0));
+  REQUIRE(held != nullptr);
+  ImportReport r;
+  CHECK(slot.Import(cm, Content(2), 1, &r) != X_ERROR_SUCCESS);  // waits its 10 s, then refuses
+  CHECK(r.reason == "slot locked");
+  ExpectUnchanged(slot, Content(1));
+  held.reset();
+  RemoveRoot(slot.root);
+}
+
+TEST_CASE("a staged save resolves to its stage and never touches the live package",
+          "[save_import][save_to_host]") {
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  const fs::path stage = slot.root / "Online" / "outbox" / "1";
+  fs::create_directories(stage);
+  ContentManager::StagedSaveTarget t;
+  t.xuid = kXuid;
+  t.title_id = kTitle;
+  t.file_name = "SWAPFORCE_1";
+  t.stage_dir = stage;
+  const uint64_t token = cm.ArmStagedSave(t);
+  REQUIRE(token != 0);
+  CHECK(cm.ArmStagedSave(t) == 0);  // an overlapping save of the same slot
+  CHECK(cm.StagedSaveStatus(token) == ContentManager::StagedSaveState::kArmed);
+  XCONTENT_AGGREGATE_DATA data{};
+  data.content_type = XContentType::kSavedGame;
+  data.set_file_name("SWAPFORCE_1");
+  data.xuid = kXuid;
+  data.title_id = kTitle;
+  CHECK_FALSE(cm.ContentExists(kXuid, data));                         // the stage is empty
+  CHECK(cm.ReplaceContent("save", kXuid, data) == X_ERROR_SUCCESS);   // moves nothing live
+  CHECK(cm.WriteContentHeaderFile(kXuid, data) == X_ERROR_SUCCESS);    // into the stage
+  CHECK(fs::exists(stage / "SWAPFORCE_1.header"));
+  CHECK(GetFile(slot.live) == Content(1));
+  CHECK(GetFile(slot.header) == slot.header_bytes);
+  CHECK_FALSE(fs::exists(slot.root / "save-backup" / "pending"));
+  // The live path stays the binding's, armed or not.
+  CHECK(cm.ResolveLivePackagePath(kXuid, data) == slot.live.parent_path());
+  // Another slot is not staged.
+  XCONTENT_AGGREGATE_DATA other = data;
+  other.set_file_name("SWAPFORCE_2");
+  CHECK(cm.ResolveLivePackagePath(kXuid, other) == cm.ResolveLivePackagePath(kXuid, other));
+  CHECK(cm.DisarmStagedSave(token));
+  CHECK(cm.StagedSaveStatus(token) == ContentManager::StagedSaveState::kNone);
+  CHECK(cm.ContentExists(kXuid, data));  // disarmed: the live package again
+  RemoveRoot(slot.root);
+}
+
 #endif  // REX_PLATFORM_WIN32

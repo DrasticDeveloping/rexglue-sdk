@@ -12,6 +12,8 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -151,6 +153,10 @@ struct SaveImportBinding {
   std::filesystem::path package_file;  // the live data file inside the package folder
   std::filesystem::path header_file;   // the package's header
   uint64_t file_size = 0;       // the exact length of the data file
+  // online_save_to_host: the header's hash bound at the pick; with check_header the import refuses
+  // a header of another hash.
+  Sha256 header_sha{};
+  bool check_header = false;
 };
 
 class ContentManager {
@@ -222,7 +228,46 @@ class ContentManager {
   // In the constructor, after RecoverInterruptedReplacements; a no-op without save-backup/import.
   void RecoverInterruptedImports();
 
+  // ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ----------------------
+  // A staged save: while an arm is live, every operation on that exact saved game (profile, title,
+  // file name) resolves to `stage_dir` instead of the live package: ContentExists, CreateContent,
+  // OpenContent and its mount, the header WriteContentHeaderFile writes, CloseContent; ReplaceContent
+  // and DeleteContent of it touch nothing live. ListContent and ReadContentHeaderFile keep reading the
+  // live files. One arm per saved game; the arm is named by its token, which follows the operation
+  // through a deferred XamContentCreate as well (the arm, not the thread, decides).
+  struct StagedSaveTarget {
+    uint64_t xuid = 0;
+    uint32_t title_id = 0;
+    std::string file_name;          // SWAPFORCE_<n>
+    std::filesystem::path stage_dir;  // an empty folder the caller made
+  };
+  enum class StagedSaveState : uint8_t { kNone, kArmed, kOpen, kClosed };
+  // A token, or 0 when an arm for that saved game is live already (an overlapping save).
+  uint64_t ArmStagedSave(const StagedSaveTarget& target);
+  StagedSaveState StagedSaveStatus(uint64_t token) const;
+  // Ends an arm that never opened or that closed; an open arm is ended by its close. False: still open.
+  bool DisarmStagedSave(uint64_t token);
+  // The live package folder of a saved game, never the stage (the import binds it).
+  std::filesystem::path ResolveLivePackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  // The native saved-game write's cross-process slot write lock (SlotWriteLock): taken by
+  // XamContentCreate for CREATE_ALWAYS and TRUNCATE_EXISTING of a saved game before anything changes,
+  // given back when that root closes (or the create fails). A staged save takes none. Waits up to 10 s,
+  // then goes on without it and logs (offline play never fails on the lock).
+  void AcquireSaveWriteLock(const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  void ReleaseSaveWriteLock(const std::string_view root_name);
+
  private:
+  struct StagedArm {
+    uint64_t token = 0;
+    StagedSaveTarget target;
+    StagedSaveState state = StagedSaveState::kArmed;
+  };
+  // The live arm for a saved game, or nullptr. staged_mutex_ held.
+  const StagedArm* MatchStagedLocked(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;
+  std::optional<std::filesystem::path> StagedPackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;
+  std::optional<std::filesystem::path> StagedHeaderPath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;
+  void NoteStagedPackage(const std::filesystem::path& package_path, StagedSaveState state);
+
   std::filesystem::path ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                            uint32_t title_id = -1);
   std::filesystem::path ResolvePackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
@@ -257,6 +302,13 @@ class ContentManager {
   std::unordered_set<string::string_key_case, string::string_key_case::Hash> created_roots_;
   CommitCounter commit_counter_;
   SaveImportJournal import_journal_;
+  // online_save_to_host: the staged-save arms and the native writes' slot write locks (by root name).
+  mutable std::mutex staged_mutex_;
+  std::vector<StagedArm> staged_arms_;
+  uint64_t next_staged_token_ = 0;
+  std::mutex write_locks_mutex_;
+  std::unordered_map<string::string_key_case, std::unique_ptr<SlotWriteLock>, string::string_key_case::Hash>
+      write_locks_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;

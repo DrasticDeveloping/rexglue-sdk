@@ -10,6 +10,7 @@
  */
 
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <cwctype>
 #include <fstream>
@@ -156,6 +157,13 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
 
 std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
                                                          const XCONTENT_AGGREGATE_DATA& data) {
+  // online_save_to_host: a live staged-save arm for this saved game resolves it to its stage.
+  if (auto staged = StagedPackagePath(xuid, data)) return *staged;
+  return ResolveLivePackagePath(xuid, data);
+}
+
+std::filesystem::path ContentManager::ResolveLivePackagePath(uint64_t xuid,
+                                                             const XCONTENT_AGGREGATE_DATA& data) {
   uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
 
   // DLCs are stored in common directory
@@ -255,6 +263,8 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
 
   auto header_path =
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+  // online_save_to_host: a staged save writes its header into its stage, never the live one.
+  if (auto staged = StagedHeaderPath(xuid, data)) header_path = *staged;
   auto parent_path = header_path.parent_path();
 
   if (!std::filesystem::exists(parent_path)) {
@@ -338,6 +348,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
     // Stage 1C: closing this package is a commit (the commit counter, CloseContent).
     created_roots_.insert(string::string_key_case::create(root_name));
   }
+  NoteStagedPackage(package_path, StagedSaveState::kOpen);
   return X_ERROR_SUCCESS;
 }
 
@@ -357,8 +368,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
   }
   auto package = ResolvePackage(root_name, xuid, data);
   assert_not_null(package);
-  package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
-      data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
+  auto license_header = ResolvePackageHeaderPath(data.file_name(), xuid, kernel_state_->title_id(), data.content_type);
+  if (auto staged = StagedHeaderPath(xuid, data)) license_header = *staged;  // online_save_to_host
+  package->LoadPackageLicenseMask(license_header);
   content_license = package->GetPackageLicense();
 
   {
@@ -368,6 +380,7 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
     }
     open_packages_.insert({string::string_key_case::create(root_name), package.release()});
   }
+  NoteStagedPackage(package_path, StagedSaveState::kOpen);
   return X_ERROR_SUCCESS;
 }
 
@@ -440,10 +453,15 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
       pending_replacements_.erase(it);
     }
   }
+  const std::filesystem::path closed_path = package->package_path();
   delete package;
   if (!pending_id.empty()) {
     CommitReplacement(pending_id);
   }
+  // online_save_to_host: a staged package's close ends its write; a native write gives its slot
+  // write lock back once its replacement is committed.
+  NoteStagedPackage(closed_path, StagedSaveState::kClosed);
+  ReleaseSaveWriteLock(root_name);
   return X_ERROR_SUCCESS;
 }
 
@@ -457,6 +475,8 @@ X_RESULT ContentManager::ReplaceContent(const std::string_view root_name, uint64
   if (data.content_type != XContentType::kSavedGame) {
     return DeleteContent(xuid, data);
   }
+  // online_save_to_host: a staged save replaces nothing live (its stage starts empty).
+  if (StagedPackagePath(xuid, data)) return X_ERROR_SUCCESS;
   auto global_lock = global_critical_region_.Acquire();
   if (IsContentOpen(data)) {
     return X_ERROR_ACCESS_DENIED;
@@ -623,6 +643,8 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
   uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
   auto header_path =
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+  // online_save_to_host: a staged save's delete removes its stage's header, never the live one.
+  if (auto staged = StagedHeaderPath(xuid, data)) header_path = *staged;
   std::error_code ec2;
   bool header_removed = std::filesystem::remove(header_path, ec2);
 
@@ -820,7 +842,7 @@ X_RESULT ContentManager::ImportSavedGame(const SaveImportBinding& binding,
     return refuse(X_ERROR_ACCESS_DENIED, "header content");
   }
   data.title_id = binding.title_id;
-  const auto package_dir = ResolvePackagePath(binding.xuid, data);
+  const auto package_dir = ResolveLivePackagePath(binding.xuid, data);
   const auto header_path = ResolvePackageHeaderPath(binding.file_name, binding.xuid,
                                                     binding.title_id, XContentType::kSavedGame);
   if (!SamePath(package_dir, binding.package_file.parent_path()) ||
@@ -836,6 +858,12 @@ X_RESULT ContentManager::ImportSavedGame(const SaveImportBinding& binding,
   request.base_sha = base_sha;
   request.seq = seq;
   request.file_size = binding.file_size;
+  request.base_header_sha = binding.header_sha;
+  request.check_header = binding.check_header;
+  // online_save_to_host (design draft 5, sec. 8): the slot write lock across processes for the whole
+  // import; another game of this build saving the slot keeps it, and the import is refused (retried).
+  const auto slot_lock = SlotWriteLock::Acquire(root_path_, request.id, std::chrono::seconds(10));
+  if (!slot_lock) return refuse(X_ERROR_ACCESS_DENIED, "slot locked");
   return import_journal_.Import(
       request,
       [this, &data](const std::function<uint32_t(bool)>& body) {
@@ -849,7 +877,7 @@ X_RESULT ContentManager::SnapshotSavedGame(uint64_t xuid, const XCONTENT_AGGREGA
                                            const std::string& file_in_package,
                                            uint64_t expected_size, std::vector<uint8_t>* bytes,
                                            uint64_t* commit_count) {
-  const auto package_dir = ResolvePackagePath(xuid, data);
+  const auto package_dir = ResolveLivePackagePath(xuid, data);
   const std::string id = PackageIdOfPath(package_dir);
   auto global_lock = global_critical_region_.Acquire();
   // A pending or import folder whose status cannot be established refuses as one that exists
@@ -873,6 +901,120 @@ uint64_t ContentManager::CommitCountRaisedByThisThread(uint64_t xuid,
 }
 
 void ContentManager::RecoverInterruptedImports() { import_journal_.Recover(); }
+
+// ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ---------------------------
+
+namespace {
+bool SameFileName(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+  }
+  return true;
+}
+}  // namespace
+
+const ContentManager::StagedArm* ContentManager::MatchStagedLocked(uint64_t xuid,
+                                                                   const XCONTENT_AGGREGATE_DATA& data) const {
+  if (staged_arms_.empty() || data.content_type != XContentType::kSavedGame) return nullptr;
+  const uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  const uint32_t title =
+      (data.title_id == kCurrentlyRunningTitleId && kernel_state_) ? kernel_state_->title_id() : uint32_t(data.title_id);
+  const std::string name = data.file_name();
+  for (const StagedArm& arm : staged_arms_) {
+    if (arm.target.xuid == used_xuid && arm.target.title_id == title && SameFileName(arm.target.file_name, name)) {
+      return &arm;
+    }
+  }
+  return nullptr;
+}
+
+std::optional<std::filesystem::path> ContentManager::StagedPackagePath(uint64_t xuid,
+                                                                       const XCONTENT_AGGREGATE_DATA& data) const {
+  std::lock_guard lock(staged_mutex_);
+  const StagedArm* arm = MatchStagedLocked(xuid, data);
+  if (!arm) return std::nullopt;
+  return arm->target.stage_dir / rex::to_path(arm->target.file_name);
+}
+
+std::optional<std::filesystem::path> ContentManager::StagedHeaderPath(uint64_t xuid,
+                                                                      const XCONTENT_AGGREGATE_DATA& data) const {
+  std::lock_guard lock(staged_mutex_);
+  const StagedArm* arm = MatchStagedLocked(xuid, data);
+  if (!arm) return std::nullopt;
+  return arm->target.stage_dir / rex::to_path(arm->target.file_name + ".header");
+}
+
+void ContentManager::NoteStagedPackage(const std::filesystem::path& package_path, StagedSaveState state) {
+  std::lock_guard lock(staged_mutex_);
+  for (auto it = staged_arms_.begin(); it != staged_arms_.end(); ++it) {
+    const auto stage_package = it->target.stage_dir / rex::to_path(it->target.file_name);
+    if (!SamePath(stage_package, package_path)) continue;
+    // Open, then closed; a close never goes back to open (a second open of a closed stage is a
+    // second write: it is left at closed and the caller's check of the stage refuses it).
+    if (it->state != StagedSaveState::kClosed) it->state = state;
+    return;
+  }
+}
+
+uint64_t ContentManager::ArmStagedSave(const StagedSaveTarget& target) {
+  if (target.file_name.empty() || target.stage_dir.empty() || target.xuid == 0) return 0;
+  std::lock_guard lock(staged_mutex_);
+  for (const StagedArm& arm : staged_arms_) {
+    if (arm.target.xuid == target.xuid && arm.target.title_id == target.title_id &&
+        SameFileName(arm.target.file_name, target.file_name)) {
+      return 0;  // an overlapping save of the same saved game: refused, the first keeps its arm
+    }
+  }
+  StagedArm arm;
+  arm.token = ++next_staged_token_;
+  arm.target = target;
+  staged_arms_.push_back(arm);
+  return arm.token;
+}
+
+ContentManager::StagedSaveState ContentManager::StagedSaveStatus(uint64_t token) const {
+  std::lock_guard lock(staged_mutex_);
+  for (const StagedArm& arm : staged_arms_) {
+    if (arm.token == token) return arm.state;
+  }
+  return StagedSaveState::kNone;
+}
+
+bool ContentManager::DisarmStagedSave(uint64_t token) {
+  std::lock_guard lock(staged_mutex_);
+  for (auto it = staged_arms_.begin(); it != staged_arms_.end(); ++it) {
+    if (it->token != token) continue;
+    if (it->state == StagedSaveState::kOpen) return false;  // its close ends it
+    staged_arms_.erase(it);
+    return true;
+  }
+  return true;
+}
+
+void ContentManager::AcquireSaveWriteLock(const std::string_view root_name, uint64_t xuid,
+                                          const XCONTENT_AGGREGATE_DATA& data) {
+  if (data.content_type != XContentType::kSavedGame || StagedPackagePath(xuid, data)) return;
+  const std::string id = PackageIdOfPath(ResolveLivePackagePath(xuid, data));
+  auto lock = SlotWriteLock::Acquire(root_path_, id, std::chrono::seconds(10));
+  if (!lock) {
+    REXSYS_WARN("Content: the save {} is held by another game for 10 s; saving without its lock", id);
+    return;
+  }
+  std::lock_guard guard(write_locks_mutex_);
+  write_locks_.insert_or_assign(string::string_key_case::create(root_name), std::move(lock));
+}
+
+void ContentManager::ReleaseSaveWriteLock(const std::string_view root_name) {
+  std::unique_ptr<SlotWriteLock> lock;
+  {
+    std::lock_guard guard(write_locks_mutex_);
+    auto it = write_locks_.find(string::string_key_case(root_name));
+    if (it == write_locks_.end()) return;
+    lock = std::move(it->second);
+    write_locks_.erase(it);
+  }
+}
 
 static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
                              const std::filesystem::path& base_path) {

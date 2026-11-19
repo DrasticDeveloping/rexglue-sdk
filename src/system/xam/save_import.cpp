@@ -524,6 +524,8 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
   if (ReadWholeFile(rq.header_file, &header) != 0) return refuse(ERROR_FILE_NOT_FOUND, "header unreadable");
   Sha256 header_sha{};
   if (!Sha256Of(header, &header_sha)) return refuse(kErrMismatch, "header hash");
+  // online_save_to_host (design draft 5, sec. 8): the import is bound to the header as well.
+  if (rq.check_header && header_sha != rq.base_header_sha) return refuse(kErrMismatch, "header differs");
 
   // ---- Steps 1 to 4: the folder, the copies, the prepared record. ----
   const auto dir = ImportDir(rq.id);
@@ -566,7 +568,14 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
 
   // ---- Step 5: the install, under the lock. ----
   const auto new_file = dir / L"new.xsg";
-  enum class Check { kNone, kOpen, kPending, kPendingStatus, kBase };
+  // The live file is first moved aside into the folder (displaced.xsg) and hashed there, then the new
+  // file is moved in with no replace (online_save_to_host, design draft 5 sec. 8): a writer outside
+  // this process that changed the live file after the hash check above (an uncooperative writer; a
+  // cooperating one is kept off by the slot write lock) is found here, its file put back and the
+  // import refused, instead of being replaced unseen. A stop between the two moves leaves the live
+  // file absent and displaced.xsg in the folder: Recover puts it back.
+  const auto displaced = dir / L"displaced.xsg";
+  enum class Check { kNone, kOpen, kPending, kPendingStatus, kBase, kChanged, kDisplaced };
   Check failed = Check::kNone;
   uint32_t rename_err = 0;
   for (int attempt = 0; attempt < 4; ++attempt) {
@@ -588,13 +597,46 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
         return kErrMismatch;
       }
       if (uint32_t err = RunImportFaultPoint("install")) return err;
-      if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      if (!MoveFileExW(rq.package_file.c_str(), displaced.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        return GetLastError();  // nothing moved: retried
+      }
+      Sha256 moved{};
+      if (!HashFile(displaced, &moved) || moved != rq.base_sha) {
+        // Changed between the check and the move: put it back as it is, refuse.
+        if (MoveFileExW(displaced.c_str(), rq.package_file.c_str(), MOVEFILE_WRITE_THROUGH)) {
+          failed = Check::kChanged;
+          return kErrMismatch;
+        }
+        failed = Check::kDisplaced;
         return GetLastError();
+      }
+      if (uint32_t err = RunImportFaultPoint("displaced")) {
+        if (MoveFileExW(displaced.c_str(), rq.package_file.c_str(), MOVEFILE_WRITE_THROUGH)) return err;
+        failed = Check::kDisplaced;
+        return err;
+      }
+      if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        const uint32_t err = GetLastError();
+        // A file appeared at the live path (another writer) or the move failed: the old file goes
+        // back only to an empty place; otherwise both stay for recovery.
+        if (MoveFileExW(displaced.c_str(), rq.package_file.c_str(), MOVEFILE_WRITE_THROUGH)) return err;
+        failed = Check::kDisplaced;
+        return err;
       }
       return 0;
     });
     if (rename_err == 0 || failed != Check::kNone) break;
+  }
+  if (failed == Check::kDisplaced) {
+    unresolved_.insert(rq.id);
+    report->reason = "displaced";
+    REXSYS_ERROR("Content: the import of {} seq {} moved the live file aside and could not finish or undo it "
+                 "({}); the next start settles it",
+                 rq.id, rq.seq, rename_err);
+    return X_ERROR_IO_INCOMPLETE;
+  }
+  if (failed == Check::kChanged) {
+    return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "changed at the last moment", report);
   }
   if (failed == Check::kOpen) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "open", report);
   if (failed == Check::kPending) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "native pending", report);
@@ -640,6 +682,32 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
   return X_ERROR_SUCCESS;
 }
 
+std::unique_ptr<SlotWriteLock> SlotWriteLock::Acquire(const std::filesystem::path& content_root,
+                                                      const std::string& id, std::chrono::milliseconds wait) {
+  if (id.empty() || id.find_first_of("/\\:") != std::string::npos) return nullptr;
+  const auto dir = content_root / kBackupDir / "locks";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  const auto path = dir / rex::to_path(id + ".lock");
+  const auto until = std::chrono::steady_clock::now() + wait;
+  for (;;) {
+    // No sharing: a second opener (this process or another) gets ERROR_SHARING_VIOLATION while the
+    // handle lives; delete-on-close removes the file with the last handle, also when the process dies.
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h != INVALID_HANDLE_VALUE) return std::unique_ptr<SlotWriteLock>(new SlotWriteLock(h));
+    const DWORD err = GetLastError();
+    if ((err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED) || std::chrono::steady_clock::now() >= until) {
+      return nullptr;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
+SlotWriteLock::~SlotWriteLock() {
+  if (handle_) CloseHandle(static_cast<HANDLE>(handle_));
+}
+
 void SaveImportJournal::Recover() {
   std::lock_guard serial(mutex_);
   // Recover runs in the content manager's constructor with every setting at its default, so
@@ -682,6 +750,16 @@ void SaveImportJournal::RecoverLocked() {
   }
   for (const auto& dir : dirs) {
     const std::string id = rex::path_to_utf8(dir.filename());
+    // The slot write lock (online_save_to_host): another running game of this build that holds the
+    // package keeps its folder unsettled here (refused for this process) instead of racing it.
+    const auto slot_lock = SlotWriteLock::Acquire(root_, id, std::chrono::seconds(2));
+    if (!slot_lock) {
+      unresolved_.insert(id);
+      REXSYS_ERROR("Content: the import folder {} is not settled: another game holds its save; imports of it "
+                   "are refused until the next start",
+                   rex::path_to_utf8(dir));
+      continue;
+    }
     enum class Decision { kFinish, kDiscard, kOrphan } decision = Decision::kOrphan;
     ImportTxn txn;
     std::vector<uint8_t> text;
@@ -701,8 +779,22 @@ void SaveImportJournal::RecoverLocked() {
     } else if (ReadWholeFile(txn_path, &text) == 0 &&
                ParseImportTxn(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()),
                               &txn)) {
+      // A stop between the install's two moves (online_save_to_host): the live file absent and the
+      // old one in the folder as displaced.xsg. It goes back first, so the decision below reads the
+      // old file (did not happen). A displaced file of another hash, or a live file that is there,
+      // is left alone: the decision then reads what is live (or orphans).
+      const auto live_path = root_ / rex::to_path(txn.package);
+      const auto displaced_path = dir / L"displaced.xsg";
+      if (StatusOf(live_path) == PathState::kMissing && StatusOf(displaced_path) == PathState::kOther) {
+        Sha256 moved{};
+        if (HashFile(displaced_path, &moved) && moved == txn.old_sha &&
+            MoveFileExW(displaced_path.c_str(), live_path.c_str(), MOVEFILE_WRITE_THROUGH)) {
+          REXSYS_INFO("Content: the import of {} seq {} stopped between its two moves; the old file is back", id,
+                      txn.seq);
+        }
+      }
       Sha256 live{};
-      if (HashFile(root_ / rex::to_path(txn.package), &live)) {
+      if (HashFile(live_path, &live)) {
         if (live == txn.new_sha) decision = Decision::kFinish;
         else if (live == txn.old_sha) decision = Decision::kDiscard;
       }
@@ -772,6 +864,11 @@ X_RESULT SaveImportJournal::Import(const Request&, const LockedRunner&, ImportRe
 }
 void SaveImportJournal::Recover() {}
 void SaveImportJournal::RecoverLocked() {}
+std::unique_ptr<SlotWriteLock> SlotWriteLock::Acquire(const std::filesystem::path&, const std::string&,
+                                                      std::chrono::milliseconds) {
+  return nullptr;
+}
+SlotWriteLock::~SlotWriteLock() = default;
 uint32_t SaveImportJournal::FinishCommitted(const std::string&, const char*) { return kErrNotSupported; }
 X_RESULT SaveImportJournal::Abort(const std::string&, X_RESULT result, const std::string&, ImportReport*) {
   return result;

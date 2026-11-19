@@ -160,6 +160,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         // Close any existing mount under this root name first.
         // Games may reuse the same root without explicitly closing.
         content_manager->CloseContent(root_name);
+        // Swap Force Online online_save_to_host: the cross-process slot write lock before anything
+        // changes (a saved game only; none for a staged save), given back by this root's next
+        // CloseContent. Taken after the close above, which would give it back at once.
+        content_manager->AcquireSaveWriteLock(root_name, xuid, content_data);
         if (content_manager->ContentExists(xuid, content_data)) {
           // A saved game is kept aside until the new one is closed (see ReplaceContent).
           content_manager->ReplaceContent(root_name, xuid, content_data);
@@ -194,6 +198,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
           result = X_ERROR_PATH_NOT_FOUND;
         } else {
           content_manager->CloseContent(root_name);
+          content_manager->AcquireSaveWriteLock(root_name, xuid, content_data);  // online_save_to_host
           content_manager->ReplaceContent(root_name, xuid, content_data);
           if (content_manager->ContentExists(xuid, content_data)) {
             disposition = kDispositionState::Open;
@@ -216,6 +221,9 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
     }
+
+    // online_save_to_host: a create or open that failed gives the slot write lock back at once.
+    if (result != X_ERROR_SUCCESS) content_manager->ReleaseSaveWriteLock(root_name);
 
     if (license_mask_ptr && result == X_ERROR_SUCCESS) {
       *license_mask_ptr = content_license;
