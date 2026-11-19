@@ -86,6 +86,7 @@ bool ParseSha256Hex(std::string_view text, Sha256* out) {
 
 void SetImportFaultHook(ImportFaultHook hook) { g_fault_hook.store(hook, std::memory_order_release); }
 
+// Swap Force Online online_save_to_host: armed for this process (save_import.h).
 namespace {
 std::atomic<bool> g_save_to_host_armed{false};
 }  // namespace
@@ -236,39 +237,6 @@ bool HashFile(const std::filesystem::path& path, Sha256* sha, uint64_t* size = n
   if (ReadWholeFile(path, &bytes) != 0) return false;
   if (size) *size = bytes.size();
   return Sha256Of(bytes, sha);
-}
-
-// Whether a record's paths belong to the import folder `id` (its package's folder, separators as '_',
-// as ContentManager names it) and stay below the content root: relative, no `..`, no drive.
-bool RecordNamesSlot(const ImportTxn& txn, const std::string& id) {
-  for (const std::string* p : {&txn.package, &txn.header}) {
-    if (p->empty() || p->find("..") != std::string::npos || p->find(':') != std::string::npos ||
-        p->front() == '/' || p->front() == '\\') {
-      return false;
-    }
-  }
-  const size_t slash = txn.package.find_last_of("/\\");
-  if (slash == std::string::npos) return false;
-  std::string folder = txn.package.substr(0, slash);
-  for (char& c : folder) {
-    if (c == '/' || c == '\\') c = '_';
-  }
-  return folder == id;
-}
-
-// Every path element below `root` down to `target` (online_save_to_host, checked under the lock right
-// before the replace): each exists and is a plain folder or file, none a reparse point (a junction, a
-// symbolic link, a mount point). False on any error, a missing element or a target outside `root`.
-bool PlainChain(const std::filesystem::path& root, const std::filesystem::path& target) {
-  const std::filesystem::path rel = target.lexically_normal().lexically_relative(root.lexically_normal());
-  if (rel.empty() || rel.is_absolute() || *rel.begin() == L"..") return false;
-  std::filesystem::path p = root;
-  for (const auto& part : rel) {
-    p /= part;
-    const DWORD a = GetFileAttributesW(p.c_str());
-    if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
-  }
-  return true;
 }
 
 std::filesystem::path TmpOf(const std::filesystem::path& path) {
@@ -565,8 +533,6 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
   if (ReadWholeFile(rq.header_file, &header) != 0) return refuse(ERROR_FILE_NOT_FOUND, "header unreadable");
   Sha256 header_sha{};
   if (!Sha256Of(header, &header_sha)) return refuse(kErrMismatch, "header hash");
-  // online_save_to_host (design draft 5, sec. 8): the import is bound to the header as well.
-  if (rq.check_header && header_sha != rq.base_header_sha) return refuse(kErrMismatch, "header differs");
 
   // ---- Steps 1 to 4: the folder, the copies, the prepared record. ----
   const auto dir = ImportDir(rq.id);
@@ -609,15 +575,7 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
 
   // ---- Step 5: the install, under the lock. ----
   const auto new_file = dir / L"new.xsg";
-  // One atomic replace of the live data file (MoveFileExW REPLACE_EXISTING | WRITE_THROUGH of a file
-  // written, flushed and hashed in the import folder): the live name is never absent, so every stop
-  // leaves the old file or the new one whole. The header is never written by an import (D7); with
-  // check_header (online_save_to_host) both files are hashed again under the lock right before the
-  // replace and every path component below the content root must be a plain folder or file (no
-  // junction or link put in the way since the binding). What changes the file in the moment between
-  // that check and the rename is a documented residual race: a writer of this build is kept off by the
-  // slot write lock, a writer of another build or program is not.
-  enum class Check { kNone, kOpen, kPending, kPendingStatus, kBase, kHeader, kPath, kRevoked };
+  enum class Check { kNone, kOpen, kPending, kPendingStatus, kBase };
   Check failed = Check::kNone;
   uint32_t rename_err = 0;
   for (int attempt = 0; attempt < 4; ++attempt) {
@@ -633,51 +591,20 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
         failed = pending_now == PathState::kError ? Check::kPendingStatus : Check::kPending;
         return kErrBusy;
       }
-      if (rq.check_header && (!PlainChain(root_, rq.package_file) || !PlainChain(root_, rq.header_file) ||
-                              !PlainChain(root_, new_file))) {
-        failed = Check::kPath;
-        return kErrMismatch;
-      }
       Sha256 now{};
       if (!HashFile(rq.package_file, &now) || now != rq.base_sha) {
         failed = Check::kBase;
         return kErrMismatch;
       }
-      if (rq.check_header) {
-        Sha256 header_now{};
-        if (!HashFile(rq.header_file, &header_now) || header_now != rq.base_header_sha) {
-          failed = Check::kHeader;
-          return kErrMismatch;
-        }
-      }
       if (uint32_t err = RunImportFaultPoint("install")) return err;
-      uint32_t move_err = 0;
-      bool replaced = false;
-      const std::function<bool()> replace = [&]() -> bool {
-        if (replaced) return true;
-        if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-          move_err = GetLastError();
-          return false;
-        }
-        replaced = true;
-        return true;
-      };
-      // online_save_to_host (re-check N5): the caller's own last word, under these locks.
-      if (rq.publish) {
-        rq.publish(replace);
-      } else {
-        replace();
+      if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return GetLastError();
       }
-      if (replaced) return 0;
-      if (move_err) return move_err;
-      failed = Check::kRevoked;  // the caller did not replace: its binding no longer holds
-      return kErrMismatch;
+      return 0;
     });
     if (rename_err == 0 || failed != Check::kNone) break;
   }
-  if (failed == Check::kPath) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "a link on the path", report);
-  if (failed == Check::kRevoked) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "binding changed", report);
-  if (failed == Check::kHeader) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "header differs", report);
   if (failed == Check::kOpen) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "open", report);
   if (failed == Check::kPending) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "native pending", report);
   if (failed == Check::kPendingStatus) {
@@ -722,32 +649,6 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
   return X_ERROR_SUCCESS;
 }
 
-std::unique_ptr<SlotWriteLock> SlotWriteLock::Acquire(const std::filesystem::path& content_root,
-                                                      const std::string& id, std::chrono::milliseconds wait) {
-  if (id.empty() || id.find_first_of("/\\:") != std::string::npos) return nullptr;
-  const auto dir = content_root / kBackupDir / "locks";
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
-  const auto path = dir / rex::to_path(id + ".lock");
-  const auto until = std::chrono::steady_clock::now() + wait;
-  for (;;) {
-    // No sharing: a second opener (this process or another) gets ERROR_SHARING_VIOLATION while the
-    // handle lives; delete-on-close removes the file with the last handle, also when the process dies.
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
-    if (h != INVALID_HANDLE_VALUE) return std::unique_ptr<SlotWriteLock>(new SlotWriteLock(h));
-    const DWORD err = GetLastError();
-    if ((err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED) || std::chrono::steady_clock::now() >= until) {
-      return nullptr;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-}
-
-SlotWriteLock::~SlotWriteLock() {
-  if (handle_) CloseHandle(static_cast<HANDLE>(handle_));
-}
-
 void SaveImportJournal::Recover() {
   std::lock_guard serial(mutex_);
   // Recover runs in the content manager's constructor with every setting at its default, so
@@ -790,16 +691,6 @@ void SaveImportJournal::RecoverLocked() {
   }
   for (const auto& dir : dirs) {
     const std::string id = rex::path_to_utf8(dir.filename());
-    // The slot write lock (online_save_to_host): another running game of this build that holds the
-    // package keeps its folder unsettled here (refused for this process) instead of racing it.
-    const auto slot_lock = SlotWriteLock::Acquire(root_, id, std::chrono::seconds(2));
-    if (!slot_lock) {
-      unresolved_.insert(id);
-      REXSYS_ERROR("Content: the import folder {} is not settled: another game holds its save; imports of it "
-                   "are refused until the next start",
-                   rex::path_to_utf8(dir));
-      continue;
-    }
     enum class Decision { kFinish, kDiscard, kOrphan } decision = Decision::kOrphan;
     ImportTxn txn;
     std::vector<uint8_t> text;
@@ -814,37 +705,16 @@ void SaveImportJournal::RecoverLocked() {
                    rex::path_to_utf8(dir), txn_err);
       continue;
     }
-    bool keep = false;  // a file of the pair could not be read now: settle nothing, try at the next start
     if (txn_state == PathState::kMissing) {
       decision = Decision::kDiscard;  // a stop before I6: the install never ran
     } else if (ReadWholeFile(txn_path, &text) == 0 &&
                ParseImportTxn(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()),
                               &txn)) {
-      // The record must name this folder's own slot (its package's folder is the folder's id) and
-      // stay below the content root: a record naming anything else is never acted on (orphaned).
-      // Then both files of the pair decide (online_save_to_host, files review 5): the header must be
-      // the transaction's (an import never writes it), and the data file the old one (did not happen:
-      // the journal goes) or the new one (finished: the journal is kept as previous-import). A file
-      // that cannot be read now keeps the folder untouched for the next start (never orphaned for a
-      // transient error); a readable pair that is neither is orphaned, the journal kept as evidence.
-      if (RecordNamesSlot(txn, id)) {
-        const auto live_path = root_ / rex::to_path(txn.package);
-        const auto header_path = root_ / rex::to_path(txn.header);
-        Sha256 live{}, header{};
-        if (!HashFile(live_path, &live) || !HashFile(header_path, &header)) {
-          keep = true;
-        } else if (header == txn.header_sha) {
-          if (live == txn.new_sha) decision = Decision::kFinish;
-          else if (live == txn.old_sha) decision = Decision::kDiscard;
-        }
+      Sha256 live{};
+      if (HashFile(root_ / rex::to_path(txn.package), &live)) {
+        if (live == txn.new_sha) decision = Decision::kFinish;
+        else if (live == txn.old_sha) decision = Decision::kDiscard;
       }
-    }
-    if (keep) {
-      unresolved_.insert(id);
-      REXSYS_ERROR("Content: the import folder {} is not settled: its save or header cannot be read now; it is "
-                   "kept and imports of it are refused until a start can read them",
-                   rex::path_to_utf8(dir));
-      continue;
     }
     switch (decision) {
       case Decision::kFinish:
@@ -885,6 +755,365 @@ void SaveImportJournal::RecoverLocked() {
   }
 }
 
+// ==== Swap Force Online online_save_to_host (save_import.h, the file-safety re-check M1) =========
+// Everything below runs only in an armed process. The 1C journal above (SaveImportJournal: the 1C
+// import and its start-up recovery) is the online branch's code, unchanged.
+
+namespace {
+
+// Whether a record's paths belong to the import folder `id` (its package's folder, separators as '_',
+// as ContentManager names it) and stay below the content root: relative, no `..`, no drive.
+bool RecordNamesSlot(const ImportTxn& txn, const std::string& id) {
+  for (const std::string* p : {&txn.package, &txn.header}) {
+    if (p->empty() || p->find("..") != std::string::npos || p->find(':') != std::string::npos || p->front() == '/' ||
+        p->front() == '\\') {
+      return false;
+    }
+  }
+  const size_t slash = txn.package.find_last_of("/\\");
+  if (slash == std::string::npos) return false;
+  std::string folder = txn.package.substr(0, slash);
+  for (char& c : folder) {
+    if (c == '/' || c == '\\') c = '_';
+  }
+  return folder == id;
+}
+
+// Every path element below `root` down to `target`: each exists and is no reparse point.
+bool PlainChain(const std::filesystem::path& root, const std::filesystem::path& target) {
+  const std::filesystem::path rel = target.lexically_normal().lexically_relative(root.lexically_normal());
+  if (rel.empty() || rel.is_absolute() || *rel.begin() == L"..") return false;
+  std::filesystem::path p = root;
+  for (const auto& part : rel) {
+    p /= part;
+    const DWORD a = GetFileAttributesW(p.c_str());
+    if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+std::unique_ptr<SlotWriteLock> SlotWriteLock::Acquire(const std::filesystem::path& content_root, const std::string& id,
+                                                      std::chrono::milliseconds wait) {
+  if (id.empty() || id.find_first_of("/\\:") != std::string::npos) return nullptr;
+  const auto dir = content_root / kBackupDir / "locks";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  const auto path = dir / rex::to_path(id + ".lock");
+  const auto until = std::chrono::steady_clock::now() + wait;
+  for (;;) {
+    // No sharing: a second opener (this process or another) gets ERROR_SHARING_VIOLATION while the
+    // handle lives; delete-on-close removes the file with the last handle, also when the process dies.
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h != INVALID_HANDLE_VALUE) return std::unique_ptr<SlotWriteLock>(new SlotWriteLock(h));
+    const DWORD err = GetLastError();
+    if ((err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED) || std::chrono::steady_clock::now() >= until) {
+      return nullptr;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
+SlotWriteLock::~SlotWriteLock() {
+  if (handle_) CloseHandle(static_cast<HANDLE>(handle_));
+}
+
+HostImportJournal::HostImportJournal(std::filesystem::path root) : root_(std::move(root)) {}
+
+std::filesystem::path HostImportJournal::ImportDir(const std::string& id) const {
+  return root_ / kBackupDir / "host-import" / rex::to_path(id);
+}
+std::filesystem::path HostImportJournal::PreviousDir(const std::string& id) const {
+  return root_ / kBackupDir / "host-previous-import" / rex::to_path(id);
+}
+
+uint32_t HostImportJournal::FinishCommitted(const std::string& id) {
+  if (uint32_t err = DeleteImportFolder(PreviousDir(id), "host-prev")) return err;
+  std::error_code ec;
+  std::filesystem::create_directories(PreviousDir(id).parent_path(), ec);
+  if (!MoveFileExW(ImportDir(id).c_str(), PreviousDir(id).c_str(), MOVEFILE_WRITE_THROUGH)) return GetLastError();
+  return 0;
+}
+
+X_RESULT HostImportJournal::Abort(const std::string& id, X_RESULT result, const std::string& reason,
+                                  ImportReport* report) {
+  if (uint32_t err = DeleteImportFolder(ImportDir(id), "host-abort")) {
+    REXSYS_ERROR("Content: the refused host import of {} left its folder ({}); the next binding settles it", id, err);
+  }
+  if (report) report->reason = reason;
+  return result;
+}
+
+X_RESULT HostImportJournal::Import(const SaveImportJournal::Request& rq, const SaveImportJournal::LockedRunner& locked,
+                                   ImportReport* report) {
+  std::lock_guard serial(mutex_);
+  ImportReport scratch;
+  if (!report) report = &scratch;
+  auto refuse = [&](uint32_t err, const char* reason) {
+    report->reason = reason;
+    return X_RESULT_FROM_WIN32(err);
+  };
+
+  // ---- Step 0: checks. ----
+  if (!SaveToHostArmed()) return refuse(kErrBusy, "not armed");
+  if (unresolved_.count(rq.id)) return refuse(kErrBusy, "unresolved");
+  if (orphaned_.count(rq.id)) return refuse(kErrBusy, "orphaned");
+  std::vector<uint8_t> staged;
+  Sha256 sha{};
+  if (ReadWholeFile(rq.staged, &staged) != 0) return refuse(ERROR_FILE_NOT_FOUND, "staged unreadable");
+  if (staged.size() != rq.file_size) return refuse(kErrMismatch, "staged length");
+  if (!Sha256Of(staged, &sha) || sha != rq.new_sha) return refuse(kErrMismatch, "staged hash");
+  std::vector<uint8_t> live;
+  if (ReadWholeFile(rq.package_file, &live) != 0) return refuse(ERROR_FILE_NOT_FOUND, "live unreadable");
+  if (live.size() != rq.file_size) return refuse(kErrMismatch, "live length");
+  Sha256 live_sha{};
+  if (!Sha256Of(live, &live_sha)) return refuse(kErrMismatch, "live hash");
+  {
+    std::wstring staged_vol, live_vol;
+    bool staged_ntfs = false, live_ntfs = false;
+    if (!VolumeOf(rq.staged, &staged_vol, &staged_ntfs) || !VolumeOf(rq.package_file, &live_vol, &live_ntfs)) {
+      return refuse(kErrNotSupported, "volume unknown");
+    }
+    if (staged_vol != live_vol) return refuse(kErrNotSupported, "another volume");
+    if (!live_ntfs || RunImportFaultPoint("volume") != 0) return refuse(kErrNotSupported, "not NTFS");
+  }
+  // A native pending replacement or an unfinished 1C import of the package: refused (never both journals).
+  const auto pending_dir = root_ / kBackupDir / "pending" / rex::to_path(rq.id);
+  const auto legacy_dir = root_ / kBackupDir / "import" / rex::to_path(rq.id);
+  const PathState pending = StatusOf(pending_dir, "host.pending");
+  if (pending == PathState::kError) return refuse(kErrBusy, "pending status");
+  if (pending != PathState::kMissing) return refuse(kErrBusy, "native pending");
+  if (StatusOf(legacy_dir, "host.legacy") != PathState::kMissing) return refuse(kErrBusy, "a 1C import is unfinished");
+  const PathState folder = StatusOf(ImportDir(rq.id), "host.import");
+  if (folder == PathState::kError) return refuse(kErrBusy, "import status");
+  if (folder != PathState::kMissing) {
+    std::vector<uint8_t> text;
+    ImportTxn old_txn;
+    const bool ok = ReadWholeFile(ImportDir(rq.id) / L"txn", &text) == 0 &&
+                    ParseImportTxn(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()), &old_txn);
+    if (!ok || old_txn.phase != "committed" || old_txn.new_sha != live_sha) return refuse(kErrBusy, "unresolved");
+    if (FinishCommitted(rq.id) != 0) return refuse(kErrBusy, "cleanup pending");
+    report->finished_earlier = true;
+  }
+  if (live_sha != rq.base_sha) return refuse(kErrMismatch, "base differs");
+  {
+    const uint32_t open_check = locked([](bool open) { return open ? kErrBusy : 0u; });
+    if (open_check) return refuse(open_check, "open");
+  }
+  std::vector<uint8_t> header;
+  if (ReadWholeFile(rq.header_file, &header) != 0) return refuse(ERROR_FILE_NOT_FOUND, "header unreadable");
+  Sha256 header_sha{};
+  if (!Sha256Of(header, &header_sha)) return refuse(kErrMismatch, "header hash");
+  // The header is never written by an import: the pair stays whole only while it is the bound one.
+  if (header_sha != rq.base_header_sha) return refuse(kErrMismatch, "header differs");
+
+  // ---- Steps 1 to 4: the folder, the copies, the prepared record (as the 1C journal's). ----
+  const auto dir = ImportDir(rq.id);
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  if (ec || StatusOf(dir) != PathState::kDirectory) return refuse(ERROR_ACCESS_DENIED, "folder");
+  RunImportFaultPoint("H1");
+  if (uint32_t err = DurableWrite(dir / L"old.xsg", live, rq.base_sha, "old.xsg")) {
+    return Abort(rq.id, X_RESULT_FROM_WIN32(err), "old copy", report);
+  }
+  if (uint32_t err = DurableWrite(dir / L"old.header", header, header_sha, "old.header")) {
+    return Abort(rq.id, X_RESULT_FROM_WIN32(err), "header copy", report);
+  }
+  if (uint32_t err = DurableWrite(dir / L"new.xsg", staged, rq.new_sha, "new.xsg")) {
+    return Abort(rq.id, X_RESULT_FROM_WIN32(err), "new copy", report);
+  }
+  ImportTxn txn;
+  txn.seq = rq.seq;
+  txn.package = RelativeGeneric(root_, rq.package_file);
+  txn.header = RelativeGeneric(root_, rq.header_file);
+  txn.old_sha = rq.base_sha;
+  txn.new_sha = rq.new_sha;
+  txn.header_sha = header_sha;
+  auto write_txn = [&](const char* phase) {
+    txn.phase = phase;
+    const std::string text = FormatImportTxn(txn);
+    const auto bytes = std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    Sha256 want{};
+    Sha256Of(bytes, &want);
+    return DurableWrite(dir / L"txn", bytes, want, std::string("host.txn.") + phase);
+  };
+  if (uint32_t err = write_txn("prepared")) return Abort(rq.id, X_RESULT_FROM_WIN32(err), "prepared record", report);
+  RunImportFaultPoint("H6");
+
+  // ---- Step 5: the replace, under the caller's slot write lock and the content manager's lock. ----
+  const auto new_file = dir / L"new.xsg";
+  enum class Check { kNone, kOpen, kPending, kPath, kBase, kHeader, kRevoked };
+  Check failed = Check::kNone;
+  uint32_t rename_err = 0;
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    failed = Check::kNone;
+    rename_err = locked([&](bool open) -> uint32_t {
+      if (open) return failed = Check::kOpen, kErrBusy;
+      if (StatusOf(pending_dir, "host.pending") != PathState::kMissing) return failed = Check::kPending, kErrBusy;
+      if (!PlainChain(root_, rq.package_file) || !PlainChain(root_, rq.header_file) || !PlainChain(root_, new_file)) {
+        return failed = Check::kPath, kErrMismatch;
+      }
+      Sha256 now{};
+      if (!HashFile(rq.package_file, &now) || now != rq.base_sha) return failed = Check::kBase, kErrMismatch;
+      Sha256 header_now{};
+      if (!HashFile(rq.header_file, &header_now) || header_now != rq.base_header_sha) {
+        return failed = Check::kHeader, kErrMismatch;
+      }
+      if (uint32_t err = RunImportFaultPoint("install")) return err;
+      uint32_t move_err = 0;
+      bool replaced = false;
+      const std::function<bool()> replace = [&]() -> bool {
+        if (replaced) return true;
+        if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+          move_err = GetLastError();
+          return false;
+        }
+        replaced = true;
+        return true;
+      };
+      if (rq.publish) {
+        rq.publish(replace);
+      } else {
+        replace();
+      }
+      if (replaced) return 0u;
+      if (move_err) return move_err;
+      return failed = Check::kRevoked, kErrMismatch;  // the caller did not replace: its binding no longer holds
+    });
+    if (rename_err == 0 || failed != Check::kNone) break;
+  }
+  switch (failed) {
+    case Check::kOpen: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "open", report);
+    case Check::kPending: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "native pending", report);
+    case Check::kPath: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "a link on the path", report);
+    case Check::kBase: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "base differs", report);
+    case Check::kHeader: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "header differs", report);
+    case Check::kRevoked: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "binding changed", report);
+    case Check::kNone: break;
+  }
+  if (rename_err) return Abort(rq.id, X_RESULT_FROM_WIN32(rename_err), "install refused", report);
+  RunImportFaultPoint("H7");
+
+  // ---- Steps 6 to 8: after the replace, one policy (X_ERROR_IO_INCOMPLETE, folder kept). ----
+  auto incomplete = [&](const char* reason) {
+    unresolved_.insert(rq.id);
+    report->reason = reason;
+    REXSYS_ERROR("Content: the host import of {} seq {} is installed but not committed ({}); the next binding settles it",
+                 rq.id, rq.seq, reason);
+    return X_ERROR_IO_INCOMPLETE;
+  };
+  {
+    Sha256 back{};
+    uint64_t back_size = 0;
+    const bool injected = RunImportFaultPoint("readback") != 0;
+    if (!HashFile(rq.package_file, &back, &back_size) || injected || back_size != rq.file_size || back != rq.new_sha) {
+      return incomplete("read-back");
+    }
+    Sha256 header_now{};
+    if (!HashFile(rq.header_file, &header_now) || header_now != header_sha) return incomplete("header changed");
+  }
+  if (write_txn("installed") != 0) return incomplete("installed record");
+  if (write_txn("committed") != 0) return incomplete("committed record");
+  RunImportFaultPoint("H9");
+  if (FinishCommitted(rq.id) != 0) {
+    report->cleanup_pending = true;
+    REXSYS_WARN("Content: the host import of {} seq {} is committed; its cleanup is pending", rq.id, rq.seq);
+  }
+  return X_ERROR_SUCCESS;
+}
+
+void HostImportJournal::Recover() {
+  std::lock_guard serial(mutex_);
+  if (!SaveToHostArmed()) return;  // only a bound session settles host imports (never at start-up)
+  try {
+    RecoverLocked();
+  } catch (...) {
+    REXSYS_ERROR("Content: recovering the host import folders failed; they are kept");
+  }
+}
+
+void HostImportJournal::RecoverLocked() {
+  const auto import_root = root_ / kBackupDir / "host-import";
+  if (StatusOf(import_root) != PathState::kDirectory) return;
+  std::vector<std::filesystem::directory_entry> entries;
+  if (const uint32_t list_err = ListFolder(import_root, "host.recover.enum", &entries)) {
+    REXSYS_ERROR("Content: the host import folders cannot be listed ({}); none is settled", list_err);
+    return;
+  }
+  for (const auto& entry : entries) {
+    std::error_code entry_ec;
+    if (!entry.is_directory(entry_ec) || entry_ec) continue;
+    const auto dir = entry.path();
+    const std::string id = rex::path_to_utf8(dir.filename());
+    // The slot write lock: another running game that holds the package keeps its folder unsettled.
+    const auto slot_lock = SlotWriteLock::Acquire(root_, id, std::chrono::seconds(2));
+    if (!slot_lock) {
+      unresolved_.insert(id);
+      REXSYS_ERROR("Content: the host import folder {} is not settled: another game holds its save", rex::path_to_utf8(dir));
+      continue;
+    }
+    enum class Decision { kFinish, kDiscard, kOrphan } decision = Decision::kOrphan;
+    ImportTxn txn;
+    std::vector<uint8_t> text;
+    const auto txn_path = dir / L"txn";
+    const PathState txn_state = StatusOf(txn_path, "host.stat.txn");
+    if (txn_state == PathState::kError) {
+      unresolved_.insert(id);
+      continue;
+    }
+    bool keep = false;
+    if (txn_state == PathState::kMissing) {
+      decision = Decision::kDiscard;  // a stop before H6: the replace never ran
+    } else if (ReadWholeFile(txn_path, &text) == 0 &&
+               ParseImportTxn(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()), &txn) &&
+               RecordNamesSlot(txn, id)) {
+      // Both files of the pair decide: the header must be the transaction's (an import never writes it),
+      // and the data file the old one (did not happen) or the new one (finished). A file that cannot be
+      // read now keeps the folder for the next binding; a readable pair that is neither is orphaned.
+      Sha256 live{}, header{};
+      if (!HashFile(root_ / rex::to_path(txn.package), &live) || !HashFile(root_ / rex::to_path(txn.header), &header)) {
+        keep = true;
+      } else if (header == txn.header_sha) {
+        if (live == txn.new_sha) decision = Decision::kFinish;
+        else if (live == txn.old_sha) decision = Decision::kDiscard;
+      }
+    }
+    if (keep) {
+      unresolved_.insert(id);
+      REXSYS_ERROR("Content: the host import folder {} is kept: its save or header cannot be read now", rex::path_to_utf8(dir));
+      continue;
+    }
+    uint32_t err = 0;
+    std::filesystem::path orphan;
+    if (decision == Decision::kFinish) {
+      err = FinishCommitted(id);
+    } else if (decision == Decision::kDiscard) {
+      err = DeleteImportFolder(dir, "host-discard");
+    } else {
+      std::error_code ec;
+      orphan = root_ / kBackupDir / "host-import-orphaned" / rex::to_path(id + "-" + TimeStamp());
+      std::filesystem::create_directories(orphan.parent_path(), ec);
+      if (!MoveFileExW(dir.c_str(), orphan.c_str(), MOVEFILE_WRITE_THROUGH)) err = GetLastError();
+      orphaned_.insert(id);
+    }
+    if (err) {
+      unresolved_.insert(id);
+      REXSYS_ERROR("Content: could not settle the host import folder {} ({})", rex::path_to_utf8(dir), err);
+    } else if (decision == Decision::kOrphan) {
+      REXSYS_ERROR("Content: the host import of {} matches neither its old nor its new file; the slot is left as it is "
+                   "and the folder kept as {}",
+                   id, rex::path_to_utf8(orphan));
+    } else {
+      REXSYS_INFO("Content: the host import of {} seq {} {}", id, txn.seq,
+                  decision == Decision::kFinish ? "was finished" : "did not happen; the version before it stays");
+    }
+  }
+}
+
+
 #else  // !REX_PLATFORM_WIN32
 
 bool Sha256Of(std::span<const uint8_t>, Sha256*) { return false; }
@@ -911,13 +1140,32 @@ X_RESULT SaveImportJournal::Import(const Request&, const LockedRunner&, ImportRe
 }
 void SaveImportJournal::Recover() {}
 void SaveImportJournal::RecoverLocked() {}
+uint32_t SaveImportJournal::FinishCommitted(const std::string&, const char*) { return kErrNotSupported; }
+X_RESULT SaveImportJournal::Abort(const std::string&, X_RESULT result, const std::string&, ImportReport*) {
+  return result;
+}
+
 std::unique_ptr<SlotWriteLock> SlotWriteLock::Acquire(const std::filesystem::path&, const std::string&,
                                                       std::chrono::milliseconds) {
   return nullptr;
 }
 SlotWriteLock::~SlotWriteLock() = default;
-uint32_t SaveImportJournal::FinishCommitted(const std::string&, const char*) { return kErrNotSupported; }
-X_RESULT SaveImportJournal::Abort(const std::string&, X_RESULT result, const std::string&, ImportReport*) {
+HostImportJournal::HostImportJournal(std::filesystem::path root) : root_(std::move(root)) {}
+std::filesystem::path HostImportJournal::ImportDir(const std::string& id) const {
+  return root_ / kBackupDir / "host-import" / id;
+}
+std::filesystem::path HostImportJournal::PreviousDir(const std::string& id) const {
+  return root_ / kBackupDir / "host-previous-import" / id;
+}
+X_RESULT HostImportJournal::Import(const SaveImportJournal::Request&, const SaveImportJournal::LockedRunner&,
+                                   ImportReport* report) {
+  if (report) report->reason = "not supported";
+  return kImportNotSupported;
+}
+void HostImportJournal::Recover() {}
+void HostImportJournal::RecoverLocked() {}
+uint32_t HostImportJournal::FinishCommitted(const std::string&) { return kErrNotSupported; }
+X_RESULT HostImportJournal::Abort(const std::string&, X_RESULT result, const std::string&, ImportReport*) {
   return result;
 }
 

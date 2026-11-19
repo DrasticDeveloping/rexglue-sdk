@@ -114,16 +114,13 @@ class SaveImportJournal {
     Sha256 base_sha{};
     uint32_t seq = 0;
     uint64_t file_size = 0;               // the exact length both files must have
-    // Swap Force Online online_save_to_host (design draft 5, sec. 8): the header's hash the caller
-    // bound; with `check_header` a header of any other hash refuses in step 0 ("header differs").
+    // Swap Force Online online_save_to_host (HostImportJournal only; the 1C journal ignores both): the
+    // header's hash the caller bound, and the caller's publish: when set, the replace runs inside it,
+    // under the slot write lock and the content manager's lock, right after the import's last checks; the
+    // caller decides there whether its binding still holds (and records the install in the same breath)
+    // and calls `replace` only if it does. Returning without a replace refuses the import ("binding
+    // changed"). The caller must not take the content manager's lock or a slot lock inside it.
     Sha256 base_header_sha{};
-    bool check_header = false;
-    // online_save_to_host (re-check N5): when set, the one atomic replace runs inside this call, under the
-    // slot write lock and the content manager's lock, right after the import's last checks: the caller
-    // decides there whether its binding still holds (and records the install in the same breath) and calls
-    // `replace` only if it does; `replace` returns whether the file was replaced. Returning without a
-    // replace refuses the import ("binding changed"): the live file and the header stay as they are. The
-    // caller must not take the content manager's lock or a slot lock inside it.
     std::function<bool(const std::function<bool()>& replace)> publish;
   };
   // Runs `body` with the content manager's lock held; `body` gets whether the package is open.
@@ -172,28 +169,27 @@ class SaveImportJournal {
   bool recovery_incomplete_ = false;            // recovery could not list or finish: refuse all
 };
 
-// ---- Swap Force Online online_save_to_host: armed for this process --------------------------------------
-// The game arms it when a session binds the host's slot (client/save_to_host.cpp Bind) and never otherwise:
-// not armed (the default, offline play, the setting off), no slot write lock is made, waited for or
-// taken, no lock folder or file is created, and every saved-game path is the legacy one. Armed, it stays
-// armed until the binding ends (re-check N8): ContentManager::DisarmSaveToHost clears it, so a later
-// session with the setting off is the legacy path again.
+// ==== Swap Force Online online_save_to_host ======================================================
+// Everything below is used only by a process that a session armed (client/save_to_host.cpp Bind). A process
+// that is never armed (the default, offline play, the setting off, a guest, the server) never reaches any
+// of it: no lock, no folder, no wait, start-up included. The 1C journal above is the online branch's own.
+
+// Armed for this process: set when a session binds the host's slot, cleared when the binding ends
+// (ContentManager::DisarmSaveToHost).
 void SetSaveToHostArmed();
 bool SaveToHostArmed();
-// Use ContentManager::DisarmSaveToHost (it checks that no staged save is still open).
 void ClearSaveToHostArmed();
 
-// ---- The slot write lock (Swap Force Online online_save_to_host, design draft 5 sec. 8) ------------
-// A cross-process lock on one saved-game package: the file <content root>\save-backup\locks\<id>.lock
-// opened with no sharing and delete-on-close, so it belongs to the handle (not to a thread: the native
-// save takes it in XamContentCreate and gives it back in CloseContent, possibly on another thread) and
-// ends with the process. Every writer of this build takes it: the native saved-game write, the import
-// and the import recovery. A writer of another build or program does not (uncooperative); the import
-// detects such a write at its last moment instead (the displaced check, SaveImportJournal::Import).
+// The slot write lock: a cross-process lock on one saved-game package, the file
+// <content root>\save-backup\locks\<id>.lock opened with no sharing and delete-on-close, so it belongs to
+// its handle (not to a thread) and ends with the process. Taken only in an armed process: by the host
+// import (HostImportJournal, for its whole run), by a native write of a saved game, by the host import's
+// recovery and by the game's load of the bound slot. A writer of another build does not take it; the host
+// import refuses its save when the live file changed under it instead.
 class SlotWriteLock {
  public:
-  // The lock, waiting up to `wait` for another holder; nullptr when it was not obtained (held
-  // elsewhere for the whole wait, or the file could not be made). Not supported off Windows: nullptr.
+  // The lock, waiting up to `wait` for another holder; nullptr when it was not obtained. Off Windows:
+  // nullptr.
   static std::unique_ptr<SlotWriteLock> Acquire(const std::filesystem::path& content_root, const std::string& id,
                                                 std::chrono::milliseconds wait);
   ~SlotWriteLock();
@@ -203,6 +199,35 @@ class SlotWriteLock {
  private:
   explicit SlotWriteLock(void* handle) : handle_(handle) {}
   void* handle_ = nullptr;
+};
+
+// The host import (online_save_to_host): the host's staged save into its own live slot, journaled in its
+// own folders (save-backup\host-import, host-previous-import, host-import-orphaned), never the 1C journal's.
+// Its steps are the 1C journal's (old copies, new copy, prepared record, one replace of the data file,
+// read-back, installed, committed, cleanup); the differences: the header is bound (an import never writes
+// it, so the pair stays whole only while the live header is the bound one, byte for byte), the replace
+// runs inside the caller's publish, and its recovery runs only when a session binds (Recover), each folder
+// under its slot write lock, deciding by both files of the pair.
+class HostImportJournal {
+ public:
+  explicit HostImportJournal(std::filesystem::path root);
+  // As SaveImportJournal::Import; refused unless armed. The caller holds the package's slot write lock.
+  X_RESULT Import(const SaveImportJournal::Request& request, const SaveImportJournal::LockedRunner& locked,
+                  ImportReport* report);
+  // Settles this journal's folders; a no-op unless armed (never at start-up).
+  void Recover();
+  std::filesystem::path ImportDir(const std::string& id) const;
+  std::filesystem::path PreviousDir(const std::string& id) const;
+
+ private:
+  void RecoverLocked();
+  uint32_t FinishCommitted(const std::string& id);
+  X_RESULT Abort(const std::string& id, X_RESULT result, const std::string& reason, ImportReport* report);
+
+  std::filesystem::path root_;
+  std::mutex mutex_;
+  std::unordered_set<std::string> unresolved_;
+  std::unordered_set<std::string> orphaned_;
 };
 
 // ---- The commit counter -------------------------------------------------------------------------

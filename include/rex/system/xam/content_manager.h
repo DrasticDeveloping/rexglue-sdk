@@ -154,8 +154,9 @@ struct SaveImportBinding {
   std::filesystem::path package_file;  // the live data file inside the package folder
   std::filesystem::path header_file;   // the package's header
   uint64_t file_size = 0;       // the exact length of the data file
-  // online_save_to_host: the header's hash bound at the pick; with check_header the import refuses
-  // a header of another hash.
+  // online_save_to_host: check_header makes this the host import (HostImportJournal, armed processes
+  // only, under the slot write lock); header_sha is the header bound at the pick, and the import refuses
+  // a header of another hash. Without it, the 1C import as on the online branch.
   Sha256 header_sha{};
   bool check_header = false;
   // online_save_to_host (re-check N5): when set, the one atomic replace runs inside this call, under the
@@ -235,6 +236,9 @@ class ContentManager {
   uint64_t CommitCountRaisedByThisThread(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   // In the constructor, after RecoverInterruptedReplacements; a no-op without save-backup/import.
   void RecoverInterruptedImports();
+  // online_save_to_host (the file-safety re-check M1): settles the host import journal's folders; a no-op
+  // unless the process is armed. The game calls it when a session binds, never at start-up.
+  void RecoverHostImports();
 
   // ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ----------------------
   // A staged save: while an arm is live, every operation on that exact saved game (profile, title,
@@ -330,6 +334,7 @@ class ContentManager {
   std::unordered_set<string::string_key_case, string::string_key_case::Hash> created_roots_;
   CommitCounter commit_counter_;
   SaveImportJournal import_journal_;
+  HostImportJournal host_import_journal_;  // online_save_to_host, armed processes only
   // online_save_to_host: the staged-save arms and the native writes' slot write locks (by root name).
   mutable std::mutex staged_mutex_;
   std::vector<StagedArm> staged_arms_;

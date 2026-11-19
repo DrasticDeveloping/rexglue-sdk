@@ -144,7 +144,10 @@ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_p
 }
 
 ContentManager::ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path)
-    : kernel_state_(kernel_state), root_path_(root_path), import_journal_(root_path) {
+    : kernel_state_(kernel_state),
+      root_path_(root_path),
+      import_journal_(root_path),
+      host_import_journal_(root_path) {
   RecoverInterruptedReplacements();
   RecoverInterruptedImports();
 }
@@ -876,16 +879,22 @@ X_RESULT ContentManager::ImportSavedGame(const SaveImportBinding& binding,
   request.base_sha = base_sha;
   request.seq = seq;
   request.file_size = binding.file_size;
-  request.base_header_sha = binding.header_sha;
-  request.check_header = binding.check_header;
-  request.publish = binding.publish;
-  // online_save_to_host (design draft 5, sec. 8): the slot write lock across processes for the whole
-  // import; another game of this build saving the slot keeps it, and the import is refused (retried).
-  std::unique_ptr<SlotWriteLock> slot_lock;
-  if (SaveToHostArmed()) {
-    slot_lock = SlotWriteLock::Acquire(root_path_, request.id, std::chrono::seconds(10));
+  auto locked = [this, &data](const std::function<uint32_t(bool)>& body) {
+    auto global_lock = global_critical_region_.Acquire();
+    return body(IsSavedGameOpenLocked(data));
+  };
+  if (binding.check_header) {
+    // online_save_to_host (the file-safety re-check M1): the host import, in its own journal, only in an
+    // armed process, under the package's slot write lock for its whole run (another game of this build
+    // saving the slot keeps it, and the import is refused: the next save point tries again).
+    if (!SaveToHostArmed()) return refuse(X_ERROR_ACCESS_DENIED, "not armed");
+    request.base_header_sha = binding.header_sha;
+    request.publish = binding.publish;
+    const auto slot_lock = SlotWriteLock::Acquire(root_path_, request.id, std::chrono::seconds(10));
     if (!slot_lock) return refuse(X_ERROR_ACCESS_DENIED, "slot locked");
+    return host_import_journal_.Import(request, locked, report);
   }
+  // The 1C import: the online branch's journal, no lock, no wait.
   return import_journal_.Import(
       request,
       [this, &data](const std::function<uint32_t(bool)>& body) {
@@ -923,6 +932,8 @@ uint64_t ContentManager::CommitCountRaisedByThisThread(uint64_t xuid,
 }
 
 void ContentManager::RecoverInterruptedImports() { import_journal_.Recover(); }
+
+void ContentManager::RecoverHostImports() { host_import_journal_.Recover(); }
 
 // ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ---------------------------
 

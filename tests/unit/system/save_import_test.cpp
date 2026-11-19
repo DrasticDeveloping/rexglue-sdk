@@ -187,6 +187,20 @@ struct Slot {
   }
 
   fs::path ImportDir() const { return root / "save-backup" / "import" / kId; }
+  // online_save_to_host: the host import's binding (the header bound) and its journal's folders.
+  SaveImportBinding HostBinding() const {
+    SaveImportBinding b = Binding();
+    b.check_header = true;
+    b.header_sha = ShaOf(header_bytes);
+    return b;
+  }
+  fs::path HostImportDir() const { return root / "save-backup" / "host-import" / kId; }
+  fs::path HostOrphanRoot() const { return root / "save-backup" / "host-import-orphaned"; }
+  X_RESULT HostImport(ContentManager& cm, const std::vector<uint8_t>& bytes, uint32_t seq,
+                      ImportReport* report = nullptr) const {
+    const fs::path staged = Stage(bytes, "host" + std::to_string(seq));
+    return cm.ImportSavedGame(HostBinding(), staged, ShaOf(bytes), ShaOf(GetFile(live)), seq, report);
+  }
   fs::path PreviousDir() const { return root / "save-backup" / "previous-import" / kId; }
   fs::path OrphanRoot() const { return root / "save-backup" / "import-orphaned"; }
 
@@ -283,6 +297,12 @@ void ChildMain(const std::string& spec) {
 
   if (mode == "recover") {
     ContentManager cm(nullptr, root);  // recovery runs in the constructor
+    return;
+  }
+  if (mode == "host-import") {
+    SetSaveToHostArmed();
+    ContentManager cm(nullptr, root);
+    slot.HostImport(cm, GetFile(root / "staged" / "child.xsg"), 50);
     return;
   }
   if (mode == "import") {
@@ -601,6 +621,21 @@ TEST_CASE("a committed folder with cleanup pending is finished by recovery", "[s
 // ---- Refusals up to and including step 5: nothing changed -----------------------------------------
 
 namespace {
+// Arms the process for one test and disarms it at the end (online_save_to_host).
+struct ArmedGuard {
+  ArmedGuard() { SetSaveToHostArmed(); }
+  ~ArmedGuard() { ClearSaveToHostArmed(); }
+};
+
+bool HasHostOrphan(const Slot& slot) {
+  std::error_code ec;
+  if (!fs::is_directory(slot.HostOrphanRoot(), ec)) return false;
+  for (const auto& e : fs::directory_iterator(slot.HostOrphanRoot(), ec)) {
+    if (e.path().filename().string().rfind(kId, 0) == 0) return true;
+  }
+  return false;
+}
+
 void ExpectUnchanged(const Slot& slot, const std::vector<uint8_t>& live) {
   CHECK(GetFile(slot.live) == live);
   CHECK(GetFile(slot.header) == slot.header_bytes);
@@ -1094,47 +1129,84 @@ TEST_CASE("not armed, the saved-game paths are the legacy ones: no lock, no fold
   RemoveRoot(slot.root);
 }
 
-TEST_CASE("a pair that cannot be read at the start keeps its journal for the next start",
+TEST_CASE("a host import pair that cannot be read keeps its journal for the next binding",
           "[save_import][save_to_host][recovery]") {
   Slot slot;
   slot.Stage(Content(2), "child");
-  REQUIRE(RunChild(Spec("import", slot, "I6")) == kHitCode);  // prepared, the live file still old
+  REQUIRE(RunChild(Spec("host-import", slot, "H6")) == kHitCode);  // prepared, the live file still old
+  // A start-up never settles it (never armed: nothing of the host journal runs).
+  { ContentManager cm(nullptr, slot.root); }
+  CHECK(fs::exists(slot.HostImportDir()));
   {
-    // The live file held open with no sharing while the next start recovers: unreadable now.
+    ArmedGuard armed;
+    // The live file held open with no sharing while the binding recovers: unreadable now.
     HANDLE held = CreateFileW(slot.live.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     REQUIRE(held != INVALID_HANDLE_VALUE);
-    { ContentManager cm(nullptr, slot.root); }
+    {
+      ContentManager cm(nullptr, slot.root);
+      cm.RecoverHostImports();
+    }
     CloseHandle(held);
+    CHECK(fs::exists(slot.HostImportDir()));  // kept, not orphaned
+    CHECK_FALSE(HasHostOrphan(slot));
+    ContentManager cm(nullptr, slot.root);
+    cm.RecoverHostImports();  // readable again: settled (did not happen)
   }
-  CHECK(fs::exists(slot.ImportDir()));  // kept, not orphaned
-  CHECK_FALSE(HasOrphan(slot));
-  { ContentManager cm(nullptr, slot.root); }  // readable again: settled (did not happen)
+  CHECK_FALSE(fs::exists(slot.HostImportDir()));
   ExpectUnchanged(slot, Content(1));
   RemoveRoot(slot.root);
 }
 
-TEST_CASE("a header changed under an unfinished import is orphaned and the slot left as it is",
+TEST_CASE("a header changed under an unfinished host import is orphaned and the slot left as it is",
           "[save_import][save_to_host][recovery]") {
   Slot slot;
   slot.Stage(Content(2), "child");
-  REQUIRE(RunChild(Spec("import", slot, "I6")) == kHitCode);
+  REQUIRE(RunChild(Spec("host-import", slot, "H6")) == kHitCode);
   auto other_header = slot.header_bytes;
   other_header[0] ^= 0x01;
   PutFile(slot.header, other_header);
-  { ContentManager cm(nullptr, slot.root); }
+  {
+    ArmedGuard armed;
+    ContentManager cm(nullptr, slot.root);
+    cm.RecoverHostImports();
+  }
   CHECK(GetFile(slot.live) == Content(1));
   CHECK(GetFile(slot.header) == other_header);
-  CHECK(HasOrphan(slot));  // the journal kept as evidence
+  CHECK(HasHostOrphan(slot));  // the journal kept as evidence
+  RemoveRoot(slot.root);
+}
+
+TEST_CASE("never armed: the start-up recovery and the 1C import make no lock and never wait",
+          "[save_import][save_to_host][off]") {
+  REQUIRE_FALSE(SaveToHostArmed());
+  Slot slot;
+  slot.Stage(Content(2), "child");
+  REQUIRE(RunChild(Spec("import", slot, "I6")) == kHitCode);  // an interrupted 1C import
+  // Another game holds the slot's lock file: the 1C path neither looks at it nor waits for it.
+  auto held = SlotWriteLock::Acquire(slot.root, kId, std::chrono::milliseconds(0));
+  REQUIRE(held != nullptr);
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    ContentManager cm(nullptr, slot.root);  // the 1C recovery: as on the online branch
+    CHECK_FALSE(fs::exists(slot.ImportDir()));
+    CHECK(slot.Import(cm, Content(3), 2) == X_ERROR_SUCCESS);
+  }
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1500));
+  CHECK(GetFile(slot.live) == Content(3));
+  held.reset();
+  // With no other holder, nothing of the feature exists in the folder.
+  { ContentManager cm(nullptr, slot.root); }
+  CHECK_FALSE(fs::exists(slot.root / "save-backup" / "locks"));
+  CHECK_FALSE(fs::exists(slot.root / "save-backup" / "host-import"));
   RemoveRoot(slot.root);
 }
 
 TEST_CASE("the header is bound too", "[save_import][save_to_host]") {
   HookGuard hook;
+  ArmedGuard armed;
   Slot slot;
   ContentManager cm(nullptr, slot.root);
-  SaveImportBinding b = slot.Binding();
-  b.check_header = true;
-  b.header_sha = ShaOf(slot.header_bytes);
+  SaveImportBinding b = slot.HostBinding();
   const auto bytes = Content(2);
   ImportReport r;
   b.header_sha[0] ^= 0x01;
@@ -1145,6 +1217,18 @@ TEST_CASE("the header is bound too", "[save_import][save_to_host]") {
   CHECK(cm.ImportSavedGame(b, slot.Stage(bytes, "h2"), ShaOf(bytes), ShaOf(Content(1)), 2, &r) == X_ERROR_SUCCESS);
   CHECK(GetFile(slot.live) == bytes);
   CHECK(GetFile(slot.header) == slot.header_bytes);
+  RemoveRoot(slot.root);
+}
+
+TEST_CASE("a host import is refused unless armed", "[save_import][save_to_host][off]") {
+  REQUIRE_FALSE(SaveToHostArmed());
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  ImportReport r;
+  CHECK(slot.HostImport(cm, Content(2), 1, &r) != X_ERROR_SUCCESS);
+  CHECK(r.reason == "not armed");
+  ExpectUnchanged(slot, Content(1));
+  CHECK_FALSE(fs::exists(slot.root / "save-backup" / "locks"));
   RemoveRoot(slot.root);
 }
 
@@ -1197,9 +1281,10 @@ TEST_CASE("disarmed at the binding's end, the legacy path again; never while a s
 
 TEST_CASE("the caller's publish decides the replace under the locks", "[save_import][save_to_host]") {
   HookGuard hook;
+  ArmedGuard armed;
   Slot slot;
   ContentManager cm(nullptr, slot.root);
-  SaveImportBinding b = slot.Binding();
+  SaveImportBinding b = slot.HostBinding();
   const auto bytes = Content(2);
   ImportReport r;
   // Revoked: the publish does not replace (its binding changed): refused, the slot as it was.
@@ -1247,15 +1332,15 @@ TEST_CASE("the slot write lock has one holder across handles", "[save_import][sa
   RemoveRoot(root);
 }
 
-TEST_CASE("an import is refused while another holder has the slot write lock", "[save_import][save_to_host]") {
-  SetSaveToHostArmed();
+TEST_CASE("a host import is refused while another holder has the slot write lock", "[save_import][save_to_host]") {
+  ArmedGuard armed;
   HookGuard hook;
   Slot slot;
   ContentManager cm(nullptr, slot.root);
   auto held = SlotWriteLock::Acquire(slot.root, kId, std::chrono::milliseconds(0));
   REQUIRE(held != nullptr);
   ImportReport r;
-  CHECK(slot.Import(cm, Content(2), 1, &r) != X_ERROR_SUCCESS);  // waits its 10 s, then refuses
+  CHECK(slot.HostImport(cm, Content(2), 1, &r) != X_ERROR_SUCCESS);  // waits its 10 s, then refuses
   CHECK(r.reason == "slot locked");
   ExpectUnchanged(slot, Content(1));
   held.reset();
