@@ -1362,6 +1362,43 @@ TEST_CASE("pinned folders cannot be renamed; links and second names are not plai
   RemoveRoot(slot.root);
 }
 
+TEST_CASE("a host import keeps writers off its save and refuses one already writing", "[save_import][save_to_host]") {
+  HookGuard hook;
+  ArmedGuard armed;
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  // A writer that comes between the last hash and the replace cannot open the save for writing.
+  bool writer_kept_off = false;
+  g_hook.on_point = [&](const char* point) {
+    if (std::strcmp(point, "install") != 0) return;
+    HANDLE w = CreateFileW(slot.live.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    writer_kept_off = w == INVALID_HANDLE_VALUE;
+    if (w != INVALID_HANDLE_VALUE) CloseHandle(w);
+    // The header cannot be written either.
+    HANDLE hw = CreateFileW(slot.header.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    writer_kept_off = writer_kept_off && hw == INVALID_HANDLE_VALUE;
+    if (hw != INVALID_HANDLE_VALUE) CloseHandle(hw);
+  };
+  ImportReport r;
+  CHECK(slot.HostImport(cm, Content(2), 1, &r) == X_ERROR_SUCCESS);
+  CHECK(writer_kept_off);
+  CHECK(GetFile(slot.live) == Content(2));
+  CHECK(GetFile(slot.header) == slot.header_bytes);
+  g_hook.on_point = nullptr;
+  // A writer that already has the save open: refused, the live file left as it is.
+  HANDLE writer = CreateFileW(slot.live.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  REQUIRE(writer != INVALID_HANDLE_VALUE);
+  CHECK(slot.HostImport(cm, Content(3), 2, &r) != X_ERROR_SUCCESS);
+  CHECK(r.reason == "a writer holds the save");
+  CloseHandle(writer);
+  CHECK(GetFile(slot.live) == Content(2));
+  CHECK_FALSE(fs::exists(slot.HostImportDir()));
+  RemoveRoot(slot.root);
+}
+
 TEST_CASE("a host import is refused while another holder has the slot write lock", "[save_import][save_to_host]") {
   ArmedGuard armed;
   HookGuard hook;

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <ctime>
 #include <cwctype>
 
@@ -802,6 +803,67 @@ bool PlainFileHandle(HANDLE h) {
          (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 && info.nNumberOfLinks == 1;
 }
 
+// Every byte of a file through its handle (from its start).
+bool ReadHandle(HANDLE h, std::vector<uint8_t>* out) {
+  LARGE_INTEGER size{}, zero{};
+  if (!GetFileSizeEx(h, &size) || size.QuadPart > (int64_t(1) << 30) || !SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) {
+    return false;
+  }
+  out->assign(size_t(size.QuadPart), 0);
+  size_t done = 0;
+  while (done < out->size()) {
+    DWORD got = 0;
+    const DWORD want = DWORD(std::min<size_t>(out->size() - done, 1u << 20));
+    if (!ReadFile(h, out->data() + done, want, &got, nullptr) || got == 0) return false;
+    done += got;
+  }
+  return true;
+}
+
+bool HashHandle(HANDLE h, Sha256* sha, std::vector<uint8_t>* bytes = nullptr) {
+  std::vector<uint8_t> local;
+  std::vector<uint8_t>& b = bytes ? *bytes : local;
+  return ReadHandle(h, &b) && Sha256Of(b, sha);
+}
+
+// Whether the name `path` names the file `h` holds now (same volume, same file index).
+bool NamesSameFile(const std::filesystem::path& path, HANDLE h) {
+  OwnedHandle by_name(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  BY_HANDLE_FILE_INFORMATION a{}, b{};
+  return by_name && InfoOf(by_name.h, &a) && InfoOf(h, &b) && a.dwVolumeSerialNumber == b.dwVolumeSerialNumber &&
+         a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
+}
+
+// FILE_RENAME_INFO with its Flags member (FileRenameInfoEx, Windows 10 1709 and later), declared here so
+// the build does not depend on the SDK headers' _WIN32_WINNT.
+struct RenameInfoEx {
+  DWORD flags;
+  HANDLE root_directory;
+  DWORD file_name_length;
+  WCHAR file_name[1];
+};
+constexpr DWORD kRenameReplaceIfExists = 0x00000001;  // FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+constexpr DWORD kRenamePosixSemantics = 0x00000002;   // FILE_RENAME_FLAG_POSIX_SEMANTICS
+constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+
+// Renames the file `h` (opened with DELETE access) to `name` inside the folder `dir` (a pinned handle),
+// replacing what is there with POSIX semantics: the replace succeeds while the replaced file is held
+// open with FILE_SHARE_DELETE (this import's own hold), and is one atomic step on NTFS.
+bool RenameInto(HANDLE h, HANDLE dir, const std::wstring& name, uint32_t* err) {
+  std::vector<uint8_t> buffer(sizeof(RenameInfoEx) + name.size() * sizeof(WCHAR));
+  auto* info = reinterpret_cast<RenameInfoEx*>(buffer.data());
+  info->flags = kRenameReplaceIfExists | kRenamePosixSemantics;
+  info->root_directory = dir;
+  info->file_name_length = DWORD(name.size() * sizeof(WCHAR));
+  std::memcpy(info->file_name, name.data(), info->file_name_length);
+  if (!SetFileInformationByHandle(h, kFileRenameInfoEx, info, DWORD(buffer.size()))) {
+    *err = GetLastError();
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 bool PlainFile(const std::filesystem::path& path) {
@@ -1014,7 +1076,7 @@ X_RESULT HostImportJournal::Import(const SaveImportJournal::Request& rq, const S
 
   // ---- Step 5: the replace, under the caller's slot write lock and the content manager's lock. ----
   const auto new_file = dir / L"new.xsg";
-  enum class Check { kNone, kOpen, kPending, kPath, kBase, kHeader, kRevoked };
+  enum class Check { kNone, kOpen, kPending, kPath, kWriter, kBase, kHeader, kNew, kChanged, kNoReplace, kRevoked };
   Check failed = Check::kNone;
   std::string pin_why;
   uint32_t rename_err = 0;
@@ -1033,21 +1095,50 @@ X_RESULT HostImportJournal::Import(const SaveImportJournal::Request& rq, const S
         if (pin) pin_why = "a link or a second name on a file";
         return failed = Check::kPath, kErrMismatch;
       }
+      // M7, competing writers. The data file is held from its last hash through the replace with no
+      // FILE_SHARE_WRITE: a writer that already has it open makes this open fail (refused, the next save
+      // point tries again), and none can open it for writing while it is held. The header is held with no
+      // write and no delete sharing, so it is byte for byte the bound header through the replace: the
+      // import never writes it, and the new data file goes next to exactly the header it was checked
+      // against, so the pair cannot mix. The new copy is held too and hashed again.
+      HANDLE package_dir = static_cast<HANDLE>(pin->Handle(rq.package_file.parent_path()));
+      if (!package_dir) return failed = Check::kPath, kErrMismatch;
+      OwnedHandle old_h(CreateFileW(rq.package_file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                                    OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (!old_h) return failed = Check::kWriter, kErrBusy;
       Sha256 now{};
-      if (!HashFile(rq.package_file, &now) || now != rq.base_sha) return failed = Check::kBase, kErrMismatch;
+      if (!PlainFileHandle(old_h.h)) return failed = Check::kPath, kErrMismatch;
+      if (!HashHandle(old_h.h, &now) || now != rq.base_sha) return failed = Check::kBase, kErrMismatch;
+      OwnedHandle header_h(CreateFileW(rq.header_file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                       FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      if (!header_h) return failed = Check::kWriter, kErrBusy;
       Sha256 header_now{};
-      if (!HashFile(rq.header_file, &header_now) || header_now != rq.base_header_sha) {
+      if (!PlainFileHandle(header_h.h)) return failed = Check::kPath, kErrMismatch;
+      if (!HashHandle(header_h.h, &header_now) || header_now != rq.base_header_sha) {
         return failed = Check::kHeader, kErrMismatch;
       }
+      OwnedHandle new_h(CreateFileW(new_file.c_str(), GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      Sha256 new_now{};
+      if (!new_h || !PlainFileHandle(new_h.h)) return failed = Check::kPath, kErrMismatch;
+      if (!HashHandle(new_h.h, &new_now) || new_now != rq.new_sha) return failed = Check::kNew, kErrMismatch;
       if (uint32_t err = RunImportFaultPoint("install")) return err;
       uint32_t move_err = 0;
-      bool replaced = false;
+      bool replaced = false, changed = false;
       const std::function<bool()> replace = [&]() -> bool {
         if (replaced) return true;
-        if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-          move_err = GetLastError();
+        if (changed) return false;
+        // Right before the replace: the live name still names the held file and its bytes are still the
+        // ones hashed. Anything else (a writer of another build that bypassed the lock and the hold): our
+        // save is refused and the live file is left exactly as it is.
+        Sha256 last{};
+        if (!NamesSameFile(rq.package_file, old_h.h) || !HashHandle(old_h.h, &last) || last != rq.base_sha) {
+          changed = true;
           return false;
         }
+        // One atomic replace, resolved in the held package folder (M6), with POSIX semantics so it succeeds
+        // while this import still holds the replaced file.
+        if (!RenameInto(new_h.h, package_dir, rq.package_file.filename().wstring(), &move_err)) return false;
         replaced = true;
         return true;
       };
@@ -1057,6 +1148,10 @@ X_RESULT HostImportJournal::Import(const SaveImportJournal::Request& rq, const S
         replace();
       }
       if (replaced) return 0u;
+      if (changed) return failed = Check::kChanged, kErrMismatch;
+      if (move_err == ERROR_INVALID_PARAMETER || move_err == ERROR_NOT_SUPPORTED || move_err == ERROR_INVALID_FUNCTION) {
+        return failed = Check::kNoReplace, kErrNotSupported;  // no exclusive replace on this volume: refused
+      }
       if (move_err) return move_err;
       return failed = Check::kRevoked, kErrMismatch;  // the caller did not replace: its binding no longer holds
     });
@@ -1066,8 +1161,12 @@ X_RESULT HostImportJournal::Import(const SaveImportJournal::Request& rq, const S
     case Check::kOpen: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "open", report);
     case Check::kPending: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "native pending", report);
     case Check::kPath: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "a link on the path (" + pin_why + ")", report);
+    case Check::kWriter: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "a writer holds the save", report);
     case Check::kBase: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "base differs", report);
     case Check::kHeader: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "header differs", report);
+    case Check::kNew: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "new copy changed", report);
+    case Check::kChanged: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "changed before the replace", report);
+    case Check::kNoReplace: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrNotSupported), "no exclusive replace here", report);
     case Check::kRevoked: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "binding changed", report);
     case Check::kNone: break;
   }
