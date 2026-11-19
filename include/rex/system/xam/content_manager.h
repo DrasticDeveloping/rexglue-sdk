@@ -137,7 +137,13 @@ class ContentPackage {
 
   uint32_t GetPackageLicense() const { return license_; }
 
+  // online_save_to_host (the file-safety re-check M5): the slot write lock this mount's create took
+  // (ContentManager's token, 0: none), given back exactly once when the mount goes.
+  uint64_t write_lock_token() const { return write_lock_token_; }
+  void set_write_lock_token(uint64_t token) { write_lock_token_ = token; }
+
  private:
+  uint64_t write_lock_token_ = 0;
   KernelState* kernel_state_;
   std::string root_name_;
   std::string device_path_;
@@ -285,11 +291,16 @@ class ContentManager {
   std::filesystem::path ResolveLivePackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   // The native saved-game write's cross-process slot write lock (SlotWriteLock), only while the process is
   // armed (SaveToHostArmed): taken by XamContentCreate for CREATE_ALWAYS and TRUNCATE_EXISTING of a saved
-  // game before anything changes, given back when that root closes (or the create fails). Not armed: true
-  // at once, nothing made, nothing waited for (the legacy path). Armed: a staged save takes none; a write
-  // of the bound slot outside its staged save is refused (false); another saved game waits up to 10 s
-  // for the lock and is refused (false) when it does not come: never written without it.
-  bool AcquireSaveWriteLock(const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  // game before anything changes. It belongs to that one operation (the file-safety re-check M5): its
+  // token goes to the mount the create makes (AttachSaveWriteLock) and is given back exactly once when that
+  // mount goes (CloseContent, UnmountContent, UnmountAndDeleteContent), or at once by the operation itself
+  // when its create or open fails (ReleaseSaveWriteLockToken). No other operation can give it back. Not
+  // armed: true, token 0, nothing made, nothing waited for (the legacy path). Armed: a staged save takes
+  // none; a write of the bound slot outside its staged save is refused (false); another saved game waits
+  // up to 10 s for the lock and is refused (false) when it does not come: never written without it.
+  bool AcquireSaveWriteLock(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data, uint64_t* token);
+  void AttachSaveWriteLock(const std::string_view root_name, uint64_t token);
+  void ReleaseSaveWriteLockToken(uint64_t token);
   // The bound slot while a session saves to the host's file (the game: Bind and EndSession): armed, every
   // native write path to it but its staged save is refused (CREATE_ALWAYS, TRUNCATE_EXISTING, CREATE_NEW,
   // OPEN_ALWAYS through XamContentCreate, XamContentDelete, unmount-and-delete).
@@ -302,7 +313,6 @@ class ContentManager {
   void DisarmSaveToHost();
   // Armed, and `data` is the bound slot's live content (not a staged save): such a write is refused.
   bool IsBoundLiveSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;
-  void ReleaseSaveWriteLock(const std::string_view root_name);
   // The slot write lock of a saved game's live package, for a reader that must never see a file the
   // import is replacing (the game's load of the bound slot during a session): waits up to `wait`;
   // nullptr when another holder kept it for the whole wait.
@@ -363,11 +373,10 @@ class ContentManager {
   std::vector<StagedArm> staged_arms_;
   uint64_t next_staged_token_ = 0;
   std::mutex write_locks_mutex_;
-  std::atomic<bool> any_write_lock_{false};  // a native write ever took a lock (ReleaseSaveWriteLock looks)
   bool bound_set_ = false;               // staged_mutex_
   StagedSaveTarget bound_;               // staged_mutex_ (stage_dir unused)
-  std::unordered_map<string::string_key_case, std::unique_ptr<SlotWriteLock>, string::string_key_case::Hash>
-      write_locks_;
+  std::unordered_map<uint64_t, std::unique_ptr<SlotWriteLock>> write_locks_;  // by token (write_locks_mutex_)
+  uint64_t next_write_lock_token_ = 0;                                         // write_locks_mutex_
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;

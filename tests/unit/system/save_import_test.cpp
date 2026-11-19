@@ -1113,10 +1113,12 @@ TEST_CASE("not armed, the saved-game paths are the legacy ones: no lock, no fold
   data.title_id = kTitle;
   cm.SetBoundSavedGame(kXuid, kTitle, "SWAPFORCE_1");  // even a bound slot: not armed, nothing changes
   const auto t0 = std::chrono::steady_clock::now();
-  CHECK(cm.AcquireSaveWriteLock("save", kXuid, data));
+  uint64_t token = 1;
+  CHECK(cm.AcquireSaveWriteLock(kXuid, data, &token));
+  CHECK(token == 0);  // none taken
   CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));
   CHECK_FALSE(cm.IsBoundLiveSavedGame(kXuid, data));
-  cm.ReleaseSaveWriteLock("save");
+  cm.ReleaseSaveWriteLockToken(token);
   ContentManager::StagedSaveTarget t;
   t.xuid = kXuid;
   t.title_id = kTitle;
@@ -1255,7 +1257,9 @@ TEST_CASE("disarmed at the binding's end, always: the legacy path again, no stag
   // A lock taken while armed (another slot's native write) is given back after the disarm too.
   XCONTENT_AGGREGATE_DATA other = data;
   other.set_file_name("SWAPFORCE_2");
-  REQUIRE(cm.AcquireSaveWriteLock("other", kXuid, other));
+  uint64_t other_token = 0;
+  REQUIRE(cm.AcquireSaveWriteLock(kXuid, other, &other_token));
+  REQUIRE(other_token != 0);
   cm.DisarmSaveToHost();
   CHECK_FALSE(SaveToHostArmed());
   CHECK_FALSE(cm.IsBoundLiveSavedGame(kXuid, data));  // the binding itself is gone
@@ -1268,11 +1272,16 @@ TEST_CASE("disarmed at the binding's end, always: the legacy path again, no stag
     return n;
   };
   CHECK(locks() == 1);  // still held after the disarm
-  cm.ReleaseSaveWriteLock("other");
+  cm.ReleaseSaveWriteLockToken(other_token + 1);  // another operation's token gives nothing back (M5)
+  CHECK(locks() == 1);
+  cm.ReleaseSaveWriteLockToken(other_token);
   CHECK(locks() == 0);  // given back (delete-on-close)
+  cm.ReleaseSaveWriteLockToken(other_token);  // once only: a second release is nothing
   // Off again: no lock, no wait, no staged save, the import takes no lock.
   const auto t0 = std::chrono::steady_clock::now();
-  CHECK(cm.AcquireSaveWriteLock("save", kXuid, data));
+  uint64_t none = 1;
+  CHECK(cm.AcquireSaveWriteLock(kXuid, data, &none));
+  CHECK(none == 0);
   CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));
   CHECK(cm.ArmStagedSave(t) == 0);
   CHECK(slot.Import(cm, Content(2), 1) == X_ERROR_SUCCESS);
@@ -1448,7 +1457,8 @@ TEST_CASE("armed, the bound slot refuses every native write but its staged save"
   data.title_id = kTitle;
   cm.SetBoundSavedGame(kXuid, kTitle, "SWAPFORCE_1");
   CHECK(cm.IsBoundLiveSavedGame(kXuid, data));
-  CHECK_FALSE(cm.AcquireSaveWriteLock("save", kXuid, data));       // a native write: refused
+  uint64_t token = 0;
+  CHECK_FALSE(cm.AcquireSaveWriteLock(kXuid, data, &token));       // a native write: refused
   CHECK(cm.DeleteContent(kXuid, data) == X_ERROR_ACCESS_DENIED);    // a delete: refused
   CHECK(GetFile(slot.live) == Content(1));
   // Another slot of the same profile: locked, never written without the lock.
@@ -1458,10 +1468,10 @@ TEST_CASE("armed, the bound slot refuses every native write but its staged save"
     auto held = SlotWriteLock::Acquire(slot.root, "E000000000000001_415608E9_00000001_SWAPFORCE_2",
                                        std::chrono::milliseconds(0));
     REQUIRE(held != nullptr);
-    CHECK_FALSE(cm.AcquireSaveWriteLock("save2", kXuid, other));  // 10 s, then refused, not written anyway
+    CHECK_FALSE(cm.AcquireSaveWriteLock(kXuid, other, &token));  // 10 s, then refused, not written anyway
   }
-  CHECK(cm.AcquireSaveWriteLock("save2", kXuid, other));
-  cm.ReleaseSaveWriteLock("save2");
+  CHECK(cm.AcquireSaveWriteLock(kXuid, other, &token));
+  cm.ReleaseSaveWriteLockToken(token);
   cm.ClearBoundSavedGame();
   CHECK_FALSE(cm.IsBoundLiveSavedGame(kXuid, data));
   RemoveRoot(slot.root);

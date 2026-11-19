@@ -147,6 +147,8 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     // online_save_to_host (the file-safety re-check M4): this call takes the staged-save arm of its saved
     // game, if one waits, for its whole run; no other call is ever routed to that stage. Not armed: one load.
     ContentManager::StagedClaim staged_claim(content_manager, xuid, content_data);
+    // The slot write lock this call takes, if any (M5): it belongs to this call alone.
+    uint64_t lock_token = 0;
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
     switch (flags & 0xF) {
@@ -170,7 +172,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         // Swap Force Online online_save_to_host: the cross-process slot write lock before anything
         // changes (a saved game only; none for a staged save), given back by this root's next
         // CloseContent. Taken after the close above, which would give it back at once.
-        if (!content_manager->AcquireSaveWriteLock(root_name, xuid, content_data)) {
+        if (!content_manager->AcquireSaveWriteLock(xuid, content_data, &lock_token)) {
           result = X_ERROR_ACCESS_DENIED;  // armed only: the bound slot, or a lock that did not come
           break;
         }
@@ -212,7 +214,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
           result = X_ERROR_PATH_NOT_FOUND;
         } else {
           content_manager->CloseContent(root_name);
-          if (!content_manager->AcquireSaveWriteLock(root_name, xuid, content_data)) {  // online_save_to_host
+          if (!content_manager->AcquireSaveWriteLock(xuid, content_data, &lock_token)) {  // online_save_to_host
             result = X_ERROR_ACCESS_DENIED;
             break;
           }
@@ -239,8 +241,13 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
     }
 
-    // online_save_to_host: a create or open that failed gives the slot write lock back at once.
-    if (result != X_ERROR_SUCCESS) content_manager->ReleaseSaveWriteLock(root_name);
+    // online_save_to_host (M5): this call's own lock goes with the mount it made, or back at once when the
+    // create or open failed. A call that took none (a duplicate open, a read) gives nothing back.
+    if (result == X_ERROR_SUCCESS) {
+      content_manager->AttachSaveWriteLock(root_name, lock_token);
+    } else {
+      content_manager->ReleaseSaveWriteLockToken(lock_token);
+    }
 
     if (license_mask_ptr && result == X_ERROR_SUCCESS) {
       *license_mask_ptr = content_license;

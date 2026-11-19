@@ -476,14 +476,15 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
     }
   }
   const std::filesystem::path closed_path = package->package_path();
+  const uint64_t lock_token = package->write_lock_token();
   delete package;
   if (!pending_id.empty()) {
     CommitReplacement(pending_id);
   }
-  // online_save_to_host: a staged package's close ends its write; a native write gives its slot
-  // write lock back once its replacement is committed.
+  // online_save_to_host: a staged package's close ends its write; a native write gives its own slot
+  // write lock back once its replacement is committed (M5: the mount's token, once).
   NoteStagedPackage(closed_path, StagedSaveState::kClosed);
-  ReleaseSaveWriteLock(root_name);
+  ReleaseSaveWriteLockToken(lock_token);
   return X_ERROR_SUCCESS;
 }
 
@@ -694,7 +695,9 @@ X_RESULT ContentManager::UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_
     created_roots_.erase(it->first);
     package = DetachPackage(it);
   }
+  const uint64_t lock_token = package->write_lock_token();  // online_save_to_host (M5): once, here
   delete package;
+  ReleaseSaveWriteLockToken(lock_token);
   return X_ERROR_SUCCESS;
 }
 
@@ -714,7 +717,9 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
       package = DetachPackage(it);
     }
   }
+  const uint64_t lock_token = package ? package->write_lock_token() : 0;  // online_save_to_host (M5)
   delete package;
+  ReleaseSaveWriteLockToken(lock_token);
 
   // Delete phase: remove package directory and .header file
   auto package_path = ResolvePackagePath(xuid, data);
@@ -1069,8 +1074,8 @@ bool ContentManager::DisarmStagedSave(uint64_t token) {
   return true;
 }
 
-bool ContentManager::AcquireSaveWriteLock(const std::string_view root_name, uint64_t xuid,
-                                          const XCONTENT_AGGREGATE_DATA& data) {
+bool ContentManager::AcquireSaveWriteLock(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data, uint64_t* token) {
+  *token = 0;
   if (!SaveToHostArmed()) return true;  // not armed: the legacy path, nothing made or waited for
   if (data.content_type != XContentType::kSavedGame || StagedPackagePath(xuid, data)) return true;
   if (IsBoundLiveSavedGame(xuid, data)) {
@@ -1085,9 +1090,22 @@ bool ContentManager::AcquireSaveWriteLock(const std::string_view root_name, uint
     return false;
   }
   std::lock_guard guard(write_locks_mutex_);
-  write_locks_.insert_or_assign(string::string_key_case::create(root_name), std::move(lock));
-  any_write_lock_.store(true, std::memory_order_release);
+  *token = ++next_write_lock_token_;
+  write_locks_.emplace(*token, std::move(lock));
   return true;
+}
+
+void ContentManager::AttachSaveWriteLock(const std::string_view root_name, uint64_t token) {
+  if (token == 0) return;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    auto it = open_packages_.find(string::string_key_case(root_name));
+    if (it != open_packages_.end() && it->second->write_lock_token() == 0) {
+      it->second->set_write_lock_token(token);
+      return;
+    }
+  }
+  ReleaseSaveWriteLockToken(token);  // no mount to carry it: given back now
 }
 
 void ContentManager::SetBoundSavedGame(uint64_t xuid, uint32_t title_id, const std::string& file_name) {
@@ -1135,14 +1153,14 @@ std::unique_ptr<SlotWriteLock> ContentManager::LockSavedGame(uint64_t xuid, cons
   return SlotWriteLock::Acquire(root_path_, PackageIdOfPath(ResolveLivePackagePath(xuid, data)), wait);
 }
 
-void ContentManager::ReleaseSaveWriteLock(const std::string_view root_name) {
-  // None was ever taken: one load (never armed). A lock taken while armed is given back at its close also
-  // after the binding ended and disarmed the process (re-check N8).
-  if (!any_write_lock_.load(std::memory_order_acquire)) return;
+void ContentManager::ReleaseSaveWriteLockToken(uint64_t token) {
+  // Token 0: none was taken (never armed, a staged save, a read): nothing to do. A token is in the map
+  // once and erased once, so a lock is given back exactly once, also after the binding ended.
+  if (token == 0) return;
   std::unique_ptr<SlotWriteLock> lock;
   {
     std::lock_guard guard(write_locks_mutex_);
-    auto it = write_locks_.find(string::string_key_case(root_name));
+    auto it = write_locks_.find(token);
     if (it == write_locks_.end()) return;
     lock = std::move(it->second);
     write_locks_.erase(it);
