@@ -616,7 +616,7 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
   // junction or link put in the way since the binding). What changes the file in the moment between
   // that check and the rename is a documented residual race: a writer of this build is kept off by the
   // slot write lock, a writer of another build or program is not.
-  enum class Check { kNone, kOpen, kPending, kPendingStatus, kBase, kHeader, kPath };
+  enum class Check { kNone, kOpen, kPending, kPendingStatus, kBase, kHeader, kPath, kRevoked };
   Check failed = Check::kNone;
   uint32_t rename_err = 0;
   for (int attempt = 0; attempt < 4; ++attempt) {
@@ -650,14 +650,32 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
         }
       }
       if (uint32_t err = RunImportFaultPoint("install")) return err;
-      if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        return GetLastError();
+      uint32_t move_err = 0;
+      bool replaced = false;
+      const std::function<bool()> replace = [&]() -> bool {
+        if (replaced) return true;
+        if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+          move_err = GetLastError();
+          return false;
+        }
+        replaced = true;
+        return true;
+      };
+      // online_save_to_host (re-check N5): the caller's own last word, under these locks.
+      if (rq.publish) {
+        rq.publish(replace);
+      } else {
+        replace();
       }
-      return 0;
+      if (replaced) return 0;
+      if (move_err) return move_err;
+      failed = Check::kRevoked;  // the caller did not replace: its binding no longer holds
+      return kErrMismatch;
     });
     if (rename_err == 0 || failed != Check::kNone) break;
   }
   if (failed == Check::kPath) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "a link on the path", report);
+  if (failed == Check::kRevoked) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "binding changed", report);
   if (failed == Check::kHeader) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "header differs", report);
   if (failed == Check::kOpen) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "open", report);
   if (failed == Check::kPending) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "native pending", report);

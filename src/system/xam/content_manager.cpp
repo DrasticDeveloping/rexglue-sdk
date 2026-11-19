@@ -878,6 +878,7 @@ X_RESULT ContentManager::ImportSavedGame(const SaveImportBinding& binding,
   request.file_size = binding.file_size;
   request.base_header_sha = binding.header_sha;
   request.check_header = binding.check_header;
+  request.publish = binding.publish;
   // online_save_to_host (design draft 5, sec. 8): the slot write lock across processes for the whole
   // import; another game of this build saving the slot keeps it, and the import is refused (retried).
   std::unique_ptr<SlotWriteLock> slot_lock;

@@ -1148,6 +1148,36 @@ TEST_CASE("the header is bound too", "[save_import][save_to_host]") {
   RemoveRoot(slot.root);
 }
 
+TEST_CASE("the caller's publish decides the replace under the locks", "[save_import][save_to_host]") {
+  HookGuard hook;
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  SaveImportBinding b = slot.Binding();
+  const auto bytes = Content(2);
+  ImportReport r;
+  // Revoked: the publish does not replace (its binding changed): refused, the slot as it was.
+  int asked = 0;
+  b.publish = [&](const std::function<bool()>&) {
+    ++asked;
+    return false;
+  };
+  CHECK(cm.ImportSavedGame(b, slot.Stage(bytes, "p1"), ShaOf(bytes), ShaOf(Content(1)), 1, &r) != X_ERROR_SUCCESS);
+  CHECK(r.reason == "binding changed");
+  CHECK(asked == 1);
+  ExpectUnchanged(slot, Content(1));
+  // Allowed: the replace runs inside the publish, and the file is new when the publish returns.
+  bool new_inside = false;
+  b.publish = [&](const std::function<bool()>& replace) {
+    const bool ok = replace();
+    new_inside = ok && GetFile(slot.live) == bytes;
+    return ok;
+  };
+  CHECK(cm.ImportSavedGame(b, slot.Stage(bytes, "p2"), ShaOf(bytes), ShaOf(Content(1)), 2, &r) == X_ERROR_SUCCESS);
+  CHECK(new_inside);
+  CHECK(GetFile(slot.live) == bytes);
+  RemoveRoot(slot.root);
+}
+
 TEST_CASE("the slot write lock has one holder across handles", "[save_import][save_to_host]") {
   const fs::path root = Slot::FreshRoot();
   const fs::path file = root / "save-backup" / "locks" / (std::string(kId) + ".lock");

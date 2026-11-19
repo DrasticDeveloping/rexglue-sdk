@@ -157,6 +157,13 @@ struct SaveImportBinding {
   // a header of another hash.
   Sha256 header_sha{};
   bool check_header = false;
+  // online_save_to_host (re-check N5): when set, the one atomic replace runs inside this call, under the
+  // slot write lock and the content manager's lock, right after the import's last checks: the caller
+  // decides there whether its binding still holds (and records the install in the same breath) and calls
+  // `replace` only if it does; `replace` returns whether the file was replaced. Returning without a
+  // replace refuses the import ("binding changed"): the live file and the header stay as they are. The
+  // caller must not take the content manager's lock or a slot lock inside it.
+  std::function<bool(const std::function<bool()>& replace)> publish;
 };
 
 class ContentManager {
