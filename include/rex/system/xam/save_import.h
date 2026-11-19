@@ -176,9 +176,12 @@ class SaveImportJournal {
 // The game arms it when a session binds the host's slot (client/save_to_host.cpp Bind) and never otherwise:
 // not armed (the default, offline play, the setting off), no slot write lock is made, waited for or
 // taken, no lock folder or file is created, and every saved-game path is the legacy one. Armed, it stays
-// armed for the rest of the process.
+// armed until the binding ends (re-check N8): ContentManager::DisarmSaveToHost clears it, so a later
+// session with the setting off is the legacy path again.
 void SetSaveToHostArmed();
 bool SaveToHostArmed();
+// Use ContentManager::DisarmSaveToHost (it checks that no staged save is still open).
+void ClearSaveToHostArmed();
 
 // ---- The slot write lock (Swap Force Online online_save_to_host, design draft 5 sec. 8) ------------
 // A cross-process lock on one saved-game package: the file <content root>\save-backup\locks\<id>.lock

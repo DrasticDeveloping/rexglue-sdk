@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -268,6 +269,12 @@ class ContentManager {
   // OPEN_ALWAYS through XamContentCreate, XamContentDelete, unmount-and-delete).
   void SetBoundSavedGame(uint64_t xuid, uint32_t title_id, const std::string& file_name);
   void ClearBoundSavedGame();
+  // The binding's end (re-check N8, off means off over time): the bound slot cleared and the process
+  // disarmed, so every saved-game path is the legacy one again (no lock made, waited for or refused).
+  // false, and still armed, while a staged save is still open: its late file operations must still go to
+  // its stage, never the live slot (saving was stopped for that session already). Locks taken while armed
+  // are still given back at their close.
+  bool DisarmSaveToHost();
   // Armed, and `data` is the bound slot's live content (not a staged save): such a write is refused.
   bool IsBoundLiveSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;
   void ReleaseSaveWriteLock(const std::string_view root_name);
@@ -328,6 +335,7 @@ class ContentManager {
   std::vector<StagedArm> staged_arms_;
   uint64_t next_staged_token_ = 0;
   std::mutex write_locks_mutex_;
+  std::atomic<bool> any_write_lock_{false};  // a native write ever took a lock (ReleaseSaveWriteLock looks)
   bool bound_set_ = false;               // staged_mutex_
   StagedSaveTarget bound_;               // staged_mutex_ (stage_dir unused)
   std::unordered_map<string::string_key_case, std::unique_ptr<SlotWriteLock>, string::string_key_case::Hash>

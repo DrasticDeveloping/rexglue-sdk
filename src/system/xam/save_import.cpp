@@ -92,6 +92,7 @@ std::atomic<bool> g_save_to_host_armed{false};
 
 void SetSaveToHostArmed() { g_save_to_host_armed.store(true, std::memory_order_release); }
 bool SaveToHostArmed() { return g_save_to_host_armed.load(std::memory_order_acquire); }
+void ClearSaveToHostArmed() { g_save_to_host_armed.store(false, std::memory_order_release); }
 
 uint32_t RunImportFaultPoint(const char* point) {
   const ImportFaultHook hook = g_fault_hook.load(std::memory_order_acquire);

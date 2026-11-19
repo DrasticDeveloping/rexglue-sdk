@@ -977,6 +977,7 @@ uint64_t ContentManager::ArmStagedSave(const StagedSaveTarget& target) {
   if (!SaveToHostArmed()) return 0;  // staged saves exist only in an armed process
   if (target.file_name.empty() || target.stage_dir.empty() || target.xuid == 0) return 0;
   std::lock_guard lock(staged_mutex_);
+  if (!SaveToHostArmed()) return 0;  // disarmed meanwhile (DisarmSaveToHost holds this lock)
   for (const StagedArm& arm : staged_arms_) {
     if (arm.target.xuid == target.xuid && arm.target.title_id == target.title_id &&
         SameFileName(arm.target.file_name, target.file_name)) {
@@ -1026,6 +1027,7 @@ bool ContentManager::AcquireSaveWriteLock(const std::string_view root_name, uint
   }
   std::lock_guard guard(write_locks_mutex_);
   write_locks_.insert_or_assign(string::string_key_case::create(root_name), std::move(lock));
+  any_write_lock_.store(true, std::memory_order_release);
   return true;
 }
 
@@ -1044,6 +1046,18 @@ void ContentManager::ClearBoundSavedGame() {
   bound_ = StagedSaveTarget{};
 }
 
+bool ContentManager::DisarmSaveToHost() {
+  std::lock_guard lock(staged_mutex_);
+  bound_set_ = false;
+  bound_ = StagedSaveTarget{};
+  if (!staged_arms_.empty()) {
+    REXSYS_WARN("Content: save to host stays armed: {} staged save(s) still open", staged_arms_.size());
+    return false;
+  }
+  ClearSaveToHostArmed();
+  return true;
+}
+
 bool ContentManager::IsBoundLiveSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const {
   if (!SaveToHostArmed() || data.content_type != XContentType::kSavedGame) return false;
   std::lock_guard lock(staged_mutex_);
@@ -1060,7 +1074,9 @@ std::unique_ptr<SlotWriteLock> ContentManager::LockSavedGame(uint64_t xuid, cons
 }
 
 void ContentManager::ReleaseSaveWriteLock(const std::string_view root_name) {
-  if (!SaveToHostArmed()) return;  // none was taken
+  // None was ever taken: one load (never armed). A lock taken while armed is given back at its close also
+  // after the binding ended and disarmed the process (re-check N8).
+  if (!any_write_lock_.load(std::memory_order_acquire)) return;
   std::unique_ptr<SlotWriteLock> lock;
   {
     std::lock_guard guard(write_locks_mutex_);

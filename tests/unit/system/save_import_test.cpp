@@ -1067,7 +1067,7 @@ TEST_CASE("the commit counter counts per package and records the raising thread"
 
 TEST_CASE("not armed, the saved-game paths are the legacy ones: no lock, no folder, no wait",
           "[save_import][save_to_host][off]") {
-  // Runs before any test of this binary arms the process (SetSaveToHostArmed is one-way).
+  // Runs before any test of this binary arms the process (only DisarmSaveToHost disarms it again).
   REQUIRE_FALSE(SaveToHostArmed());
   Slot slot;
   ContentManager cm(nullptr, slot.root);
@@ -1145,6 +1145,53 @@ TEST_CASE("the header is bound too", "[save_import][save_to_host]") {
   CHECK(cm.ImportSavedGame(b, slot.Stage(bytes, "h2"), ShaOf(bytes), ShaOf(Content(1)), 2, &r) == X_ERROR_SUCCESS);
   CHECK(GetFile(slot.live) == bytes);
   CHECK(GetFile(slot.header) == slot.header_bytes);
+  RemoveRoot(slot.root);
+}
+
+TEST_CASE("disarmed at the binding's end, the legacy path again; never while a staged save is open",
+          "[save_import][save_to_host][off]") {
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  XCONTENT_AGGREGATE_DATA data{};
+  data.content_type = XContentType::kSavedGame;
+  data.set_file_name("SWAPFORCE_1");
+  data.xuid = kXuid;
+  data.title_id = kTitle;
+  SetSaveToHostArmed();
+  cm.SetBoundSavedGame(kXuid, kTitle, "SWAPFORCE_1");
+  // A staged save still open keeps the process armed (its late operations must reach its stage).
+  ContentManager::StagedSaveTarget t;
+  t.xuid = kXuid;
+  t.title_id = kTitle;
+  t.file_name = "SWAPFORCE_1";
+  t.stage_dir = slot.root / "stage";
+  const uint64_t token = cm.ArmStagedSave(t);
+  REQUIRE(token != 0);
+  CHECK_FALSE(cm.DisarmSaveToHost());
+  CHECK(SaveToHostArmed());
+  CHECK_FALSE(cm.IsBoundLiveSavedGame(kXuid, data));  // the binding itself is gone
+  // A lock taken while armed (another slot's native write) is given back after the disarm too.
+  XCONTENT_AGGREGATE_DATA other = data;
+  other.set_file_name("SWAPFORCE_2");
+  REQUIRE(cm.AcquireSaveWriteLock("other", kXuid, other));
+  CHECK(cm.DisarmStagedSave(token));
+  CHECK(cm.DisarmSaveToHost());
+  CHECK_FALSE(SaveToHostArmed());
+  auto locks = [&] {
+    size_t n = 0;
+    std::error_code ec;
+    for (fs::directory_iterator it(slot.root / "save-backup" / "locks", ec), end; !ec && it != end; it.increment(ec)) ++n;
+    return n;
+  };
+  CHECK(locks() == 1);  // still held after the disarm
+  cm.ReleaseSaveWriteLock("other");
+  CHECK(locks() == 0);  // given back (delete-on-close)
+  // Off again: no lock, no wait, no staged save, the import takes no lock.
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK(cm.AcquireSaveWriteLock("save", kXuid, data));
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));
+  CHECK(cm.ArmStagedSave(t) == 0);
+  CHECK(slot.Import(cm, Content(2), 1) == X_ERROR_SUCCESS);
   RemoveRoot(slot.root);
 }
 
