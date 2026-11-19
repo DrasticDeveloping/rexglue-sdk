@@ -249,11 +249,20 @@ class ContentManager {
   bool DisarmStagedSave(uint64_t token);
   // The live package folder of a saved game, never the stage (the import binds it).
   std::filesystem::path ResolveLivePackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
-  // The native saved-game write's cross-process slot write lock (SlotWriteLock): taken by
-  // XamContentCreate for CREATE_ALWAYS and TRUNCATE_EXISTING of a saved game before anything changes,
-  // given back when that root closes (or the create fails). A staged save takes none. Waits up to 10 s,
-  // then goes on without it and logs (offline play never fails on the lock).
-  void AcquireSaveWriteLock(const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  // The native saved-game write's cross-process slot write lock (SlotWriteLock), only while the process is
+  // armed (SaveToHostArmed): taken by XamContentCreate for CREATE_ALWAYS and TRUNCATE_EXISTING of a saved
+  // game before anything changes, given back when that root closes (or the create fails). Not armed: true
+  // at once, nothing made, nothing waited for (the legacy path). Armed: a staged save takes none; a write
+  // of the bound slot outside its staged save is refused (false); another saved game waits up to 10 s
+  // for the lock and is refused (false) when it does not come: never written without it.
+  bool AcquireSaveWriteLock(const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  // The bound slot while a session saves to the host's file (the game: Bind and EndSession): armed, every
+  // native write path to it but its staged save is refused (CREATE_ALWAYS, TRUNCATE_EXISTING, CREATE_NEW,
+  // OPEN_ALWAYS through XamContentCreate, XamContentDelete, unmount-and-delete).
+  void SetBoundSavedGame(uint64_t xuid, uint32_t title_id, const std::string& file_name);
+  void ClearBoundSavedGame();
+  // Armed, and `data` is the bound slot's live content (not a staged save): such a write is refused.
+  bool IsBoundLiveSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;
   void ReleaseSaveWriteLock(const std::string_view root_name);
   // The slot write lock of a saved game's live package, for a reader that must never see a file the
   // import is replacing (the game's load of the bound slot during a session): waits up to `wait`;
@@ -312,6 +321,8 @@ class ContentManager {
   std::vector<StagedArm> staged_arms_;
   uint64_t next_staged_token_ = 0;
   std::mutex write_locks_mutex_;
+  bool bound_set_ = false;               // staged_mutex_
+  StagedSaveTarget bound_;               // staged_mutex_ (stage_dir unused)
   std::unordered_map<string::string_key_case, std::unique_ptr<SlotWriteLock>, string::string_key_case::Hash>
       write_locks_;
 

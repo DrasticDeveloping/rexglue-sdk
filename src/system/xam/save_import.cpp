@@ -86,6 +86,13 @@ bool ParseSha256Hex(std::string_view text, Sha256* out) {
 
 void SetImportFaultHook(ImportFaultHook hook) { g_fault_hook.store(hook, std::memory_order_release); }
 
+namespace {
+std::atomic<bool> g_save_to_host_armed{false};
+}  // namespace
+
+void SetSaveToHostArmed() { g_save_to_host_armed.store(true, std::memory_order_release); }
+bool SaveToHostArmed() { return g_save_to_host_armed.load(std::memory_order_acquire); }
+
 uint32_t RunImportFaultPoint(const char* point) {
   const ImportFaultHook hook = g_fault_hook.load(std::memory_order_acquire);
   return hook ? hook(point) : 0;

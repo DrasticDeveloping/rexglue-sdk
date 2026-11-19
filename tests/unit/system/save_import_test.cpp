@@ -1065,6 +1065,35 @@ TEST_CASE("the commit counter counts per package and records the raising thread"
 
 // ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ----------------------------
 
+TEST_CASE("not armed, the saved-game paths are the legacy ones: no lock, no folder, no wait",
+          "[save_import][save_to_host][off]") {
+  // Runs before any test of this binary arms the process (SetSaveToHostArmed is one-way).
+  REQUIRE_FALSE(SaveToHostArmed());
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  XCONTENT_AGGREGATE_DATA data{};
+  data.content_type = XContentType::kSavedGame;
+  data.set_file_name("SWAPFORCE_1");
+  data.xuid = kXuid;
+  data.title_id = kTitle;
+  cm.SetBoundSavedGame(kXuid, kTitle, "SWAPFORCE_1");  // even a bound slot: not armed, nothing changes
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK(cm.AcquireSaveWriteLock("save", kXuid, data));
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));
+  CHECK_FALSE(cm.IsBoundLiveSavedGame(kXuid, data));
+  cm.ReleaseSaveWriteLock("save");
+  ContentManager::StagedSaveTarget t;
+  t.xuid = kXuid;
+  t.title_id = kTitle;
+  t.file_name = "SWAPFORCE_1";
+  t.stage_dir = slot.root / "stage";
+  CHECK(cm.ArmStagedSave(t) == 0);
+  CHECK(cm.ResolveLivePackagePath(kXuid, data) == slot.live.parent_path());
+  CHECK(slot.Import(cm, Content(2), 1) == X_ERROR_SUCCESS);  // the 1C import, no lock taken
+  CHECK_FALSE(fs::exists(slot.root / "save-backup" / "locks"));
+  RemoveRoot(slot.root);
+}
+
 TEST_CASE("a pair that cannot be read at the start keeps its journal for the next start",
           "[save_import][save_to_host][recovery]") {
   Slot slot;
@@ -1142,6 +1171,7 @@ TEST_CASE("the slot write lock has one holder across handles", "[save_import][sa
 }
 
 TEST_CASE("an import is refused while another holder has the slot write lock", "[save_import][save_to_host]") {
+  SetSaveToHostArmed();
   HookGuard hook;
   Slot slot;
   ContentManager cm(nullptr, slot.root);
@@ -1157,6 +1187,7 @@ TEST_CASE("an import is refused while another holder has the slot write lock", "
 
 TEST_CASE("a staged save resolves to its stage and never touches the live package",
           "[save_import][save_to_host]") {
+  SetSaveToHostArmed();
   Slot slot;
   ContentManager cm(nullptr, slot.root);
   const fs::path stage = slot.root / "Online" / "outbox" / "1";
@@ -1210,6 +1241,36 @@ TEST_CASE("a load of the slot waits for the slot write lock an import holds", "[
   auto load = cm.LockSavedGame(kXuid, data, std::chrono::milliseconds(0));
   CHECK(load != nullptr);  // released: the load goes on
   load.reset();
+  RemoveRoot(slot.root);
+}
+
+TEST_CASE("armed, the bound slot refuses every native write but its staged save", "[save_import][save_to_host]") {
+  SetSaveToHostArmed();
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  XCONTENT_AGGREGATE_DATA data{};
+  data.content_type = XContentType::kSavedGame;
+  data.set_file_name("SWAPFORCE_1");
+  data.xuid = kXuid;
+  data.title_id = kTitle;
+  cm.SetBoundSavedGame(kXuid, kTitle, "SWAPFORCE_1");
+  CHECK(cm.IsBoundLiveSavedGame(kXuid, data));
+  CHECK_FALSE(cm.AcquireSaveWriteLock("save", kXuid, data));       // a native write: refused
+  CHECK(cm.DeleteContent(kXuid, data) == X_ERROR_ACCESS_DENIED);    // a delete: refused
+  CHECK(GetFile(slot.live) == Content(1));
+  // Another slot of the same profile: locked, never written without the lock.
+  XCONTENT_AGGREGATE_DATA other = data;
+  other.set_file_name("SWAPFORCE_2");
+  {
+    auto held = SlotWriteLock::Acquire(slot.root, "E000000000000001_415608E9_00000001_SWAPFORCE_2",
+                                       std::chrono::milliseconds(0));
+    REQUIRE(held != nullptr);
+    CHECK_FALSE(cm.AcquireSaveWriteLock("save2", kXuid, other));  // 10 s, then refused, not written anyway
+  }
+  CHECK(cm.AcquireSaveWriteLock("save2", kXuid, other));
+  cm.ReleaseSaveWriteLock("save2");
+  cm.ClearBoundSavedGame();
+  CHECK_FALSE(cm.IsBoundLiveSavedGame(kXuid, data));
   RemoveRoot(slot.root);
 }
 

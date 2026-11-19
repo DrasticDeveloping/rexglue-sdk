@@ -149,6 +149,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     switch (flags & 0xF) {
       case 1:  // CREATE_NEW
                // Fail if exists.
+        if (content_manager->IsBoundLiveSavedGame(xuid, content_data)) {
+          result = X_ERROR_ACCESS_DENIED;  // online_save_to_host, armed only: the bound slot is the session's
+          break;
+        }
         if (content_manager->ContentExists(xuid, content_data)) {
           result = X_ERROR_ALREADY_EXISTS;
         } else {
@@ -163,7 +167,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         // Swap Force Online online_save_to_host: the cross-process slot write lock before anything
         // changes (a saved game only; none for a staged save), given back by this root's next
         // CloseContent. Taken after the close above, which would give it back at once.
-        content_manager->AcquireSaveWriteLock(root_name, xuid, content_data);
+        if (!content_manager->AcquireSaveWriteLock(root_name, xuid, content_data)) {
+          result = X_ERROR_ACCESS_DENIED;  // armed only: the bound slot, or a lock that did not come
+          break;
+        }
         if (content_manager->ContentExists(xuid, content_data)) {
           // A saved game is kept aside until the new one is closed (see ReplaceContent).
           content_manager->ReplaceContent(root_name, xuid, content_data);
@@ -186,6 +193,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         break;
       case 4:  // OPEN_ALWAYS
                // Create if needed.
+        if (content_manager->IsBoundLiveSavedGame(xuid, content_data)) {
+          result = X_ERROR_ACCESS_DENIED;  // online_save_to_host, armed only: the bound slot is the session's
+          break;
+        }
         if (!content_manager->ContentExists(xuid, content_data)) {
           disposition = kDispositionState::Create;
         } else {
@@ -198,7 +209,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
           result = X_ERROR_PATH_NOT_FOUND;
         } else {
           content_manager->CloseContent(root_name);
-          content_manager->AcquireSaveWriteLock(root_name, xuid, content_data);  // online_save_to_host
+          if (!content_manager->AcquireSaveWriteLock(root_name, xuid, content_data)) {  // online_save_to_host
+            result = X_ERROR_ACCESS_DENIED;
+            break;
+          }
           content_manager->ReplaceContent(root_name, xuid, content_data);
           if (content_manager->ContentExists(xuid, content_data)) {
             disposition = kDispositionState::Open;

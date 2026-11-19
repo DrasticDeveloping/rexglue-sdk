@@ -43,6 +43,16 @@ namespace rex {
 namespace system {
 namespace xam {
 
+namespace {
+bool SameFileName(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+  }
+  return true;
+}
+}  // namespace
+
 static const char* kThumbnailFileName = "__thumbnail.png";
 
 static const char* kGameUserContentDirName = "profile";
@@ -625,6 +635,10 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
 }
 
 X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  if (IsBoundLiveSavedGame(xuid, data)) {  // online_save_to_host: the bound slot is the session's
+    REXSYS_ERROR("Content: deleting the bound save {} is refused while a session saves to it", data.file_name());
+    return X_ERROR_ACCESS_DENIED;
+  }
   auto global_lock = global_critical_region_.Acquire();
 
   if (IsContentOpen(data)) {
@@ -671,6 +685,10 @@ X_RESULT ContentManager::UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_
 
 X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
                                                  const XCONTENT_AGGREGATE_DATA& data) {
+  if (IsBoundLiveSavedGame(xuid, data)) {  // online_save_to_host: the bound slot is the session's
+    REXSYS_ERROR("Content: deleting the bound save {} is refused while a session saves to it", data.file_name());
+    return X_ERROR_ACCESS_DENIED;
+  }
   // Unmount phase: tolerant of not-mounted state
   ContentPackage* package = nullptr;
   {
@@ -862,8 +880,11 @@ X_RESULT ContentManager::ImportSavedGame(const SaveImportBinding& binding,
   request.check_header = binding.check_header;
   // online_save_to_host (design draft 5, sec. 8): the slot write lock across processes for the whole
   // import; another game of this build saving the slot keeps it, and the import is refused (retried).
-  const auto slot_lock = SlotWriteLock::Acquire(root_path_, request.id, std::chrono::seconds(10));
-  if (!slot_lock) return refuse(X_ERROR_ACCESS_DENIED, "slot locked");
+  std::unique_ptr<SlotWriteLock> slot_lock;
+  if (SaveToHostArmed()) {
+    slot_lock = SlotWriteLock::Acquire(root_path_, request.id, std::chrono::seconds(10));
+    if (!slot_lock) return refuse(X_ERROR_ACCESS_DENIED, "slot locked");
+  }
   return import_journal_.Import(
       request,
       [this, &data](const std::function<uint32_t(bool)>& body) {
@@ -904,15 +925,6 @@ void ContentManager::RecoverInterruptedImports() { import_journal_.Recover(); }
 
 // ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ---------------------------
 
-namespace {
-bool SameFileName(std::string_view a, std::string_view b) {
-  if (a.size() != b.size()) return false;
-  for (size_t i = 0; i < a.size(); ++i) {
-    if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
-  }
-  return true;
-}
-}  // namespace
 
 const ContentManager::StagedArm* ContentManager::MatchStagedLocked(uint64_t xuid,
                                                                    const XCONTENT_AGGREGATE_DATA& data) const {
@@ -931,6 +943,7 @@ const ContentManager::StagedArm* ContentManager::MatchStagedLocked(uint64_t xuid
 
 std::optional<std::filesystem::path> ContentManager::StagedPackagePath(uint64_t xuid,
                                                                        const XCONTENT_AGGREGATE_DATA& data) const {
+  if (!SaveToHostArmed()) return std::nullopt;  // not armed: no lock, no lookup (the legacy path)
   std::lock_guard lock(staged_mutex_);
   const StagedArm* arm = MatchStagedLocked(xuid, data);
   if (!arm) return std::nullopt;
@@ -939,6 +952,7 @@ std::optional<std::filesystem::path> ContentManager::StagedPackagePath(uint64_t 
 
 std::optional<std::filesystem::path> ContentManager::StagedHeaderPath(uint64_t xuid,
                                                                       const XCONTENT_AGGREGATE_DATA& data) const {
+  if (!SaveToHostArmed()) return std::nullopt;
   std::lock_guard lock(staged_mutex_);
   const StagedArm* arm = MatchStagedLocked(xuid, data);
   if (!arm) return std::nullopt;
@@ -946,6 +960,7 @@ std::optional<std::filesystem::path> ContentManager::StagedHeaderPath(uint64_t x
 }
 
 void ContentManager::NoteStagedPackage(const std::filesystem::path& package_path, StagedSaveState state) {
+  if (!SaveToHostArmed()) return;
   std::lock_guard lock(staged_mutex_);
   for (auto it = staged_arms_.begin(); it != staged_arms_.end(); ++it) {
     const auto stage_package = it->target.stage_dir / rex::to_path(it->target.file_name);
@@ -958,6 +973,7 @@ void ContentManager::NoteStagedPackage(const std::filesystem::path& package_path
 }
 
 uint64_t ContentManager::ArmStagedSave(const StagedSaveTarget& target) {
+  if (!SaveToHostArmed()) return 0;  // staged saves exist only in an armed process
   if (target.file_name.empty() || target.stage_dir.empty() || target.xuid == 0) return 0;
   std::lock_guard lock(staged_mutex_);
   for (const StagedArm& arm : staged_arms_) {
@@ -992,17 +1008,49 @@ bool ContentManager::DisarmStagedSave(uint64_t token) {
   return true;
 }
 
-void ContentManager::AcquireSaveWriteLock(const std::string_view root_name, uint64_t xuid,
+bool ContentManager::AcquireSaveWriteLock(const std::string_view root_name, uint64_t xuid,
                                           const XCONTENT_AGGREGATE_DATA& data) {
-  if (data.content_type != XContentType::kSavedGame || StagedPackagePath(xuid, data)) return;
+  if (!SaveToHostArmed()) return true;  // not armed: the legacy path, nothing made or waited for
+  if (data.content_type != XContentType::kSavedGame || StagedPackagePath(xuid, data)) return true;
+  if (IsBoundLiveSavedGame(xuid, data)) {
+    REXSYS_ERROR("Content: a native write of the bound save {} outside its staged save is refused",
+                 data.file_name());
+    return false;
+  }
   const std::string id = PackageIdOfPath(ResolveLivePackagePath(xuid, data));
   auto lock = SlotWriteLock::Acquire(root_path_, id, std::chrono::seconds(10));
   if (!lock) {
-    REXSYS_WARN("Content: the save {} is held by another game for 10 s; saving without its lock", id);
-    return;
+    REXSYS_ERROR("Content: the save {} is held by another game for 10 s; this write is refused", id);
+    return false;
   }
   std::lock_guard guard(write_locks_mutex_);
   write_locks_.insert_or_assign(string::string_key_case::create(root_name), std::move(lock));
+  return true;
+}
+
+void ContentManager::SetBoundSavedGame(uint64_t xuid, uint32_t title_id, const std::string& file_name) {
+  std::lock_guard lock(staged_mutex_);
+  bound_ = StagedSaveTarget{};
+  bound_.xuid = xuid;
+  bound_.title_id = title_id;
+  bound_.file_name = file_name;
+  bound_set_ = true;
+}
+
+void ContentManager::ClearBoundSavedGame() {
+  std::lock_guard lock(staged_mutex_);
+  bound_set_ = false;
+  bound_ = StagedSaveTarget{};
+}
+
+bool ContentManager::IsBoundLiveSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const {
+  if (!SaveToHostArmed() || data.content_type != XContentType::kSavedGame) return false;
+  std::lock_guard lock(staged_mutex_);
+  if (!bound_set_ || MatchStagedLocked(xuid, data)) return false;
+  const uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  const uint32_t title =
+      (data.title_id == kCurrentlyRunningTitleId && kernel_state_) ? kernel_state_->title_id() : uint32_t(data.title_id);
+  return used_xuid == bound_.xuid && title == bound_.title_id && SameFileName(bound_.file_name, data.file_name());
 }
 
 std::unique_ptr<SlotWriteLock> ContentManager::LockSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
@@ -1011,6 +1059,7 @@ std::unique_ptr<SlotWriteLock> ContentManager::LockSavedGame(uint64_t xuid, cons
 }
 
 void ContentManager::ReleaseSaveWriteLock(const std::string_view root_name) {
+  if (!SaveToHostArmed()) return;  // none was taken
   std::unique_ptr<SlotWriteLock> lock;
   {
     std::lock_guard guard(write_locks_mutex_);
