@@ -1065,25 +1065,38 @@ TEST_CASE("the commit counter counts per package and records the raising thread"
 
 // ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ----------------------------
 
-TEST_CASE("the live file changed between the check and the move aside is put back and refused",
-          "[save_import][save_to_host]") {
-  HookGuard hook;
+TEST_CASE("a pair that cannot be read at the start keeps its journal for the next start",
+          "[save_import][save_to_host][recovery]") {
   Slot slot;
-  ContentManager cm(nullptr, slot.root);
-  // An uncooperative writer lands right after step 5's hash check, before the move aside.
-  g_hook.on_point = [&](const char* p) {
-    if (std::strcmp(p, "install") == 0) PutFile(slot.live, Content(9));
-  };
-  ImportReport r;
-  CHECK(slot.Import(cm, Content(2), 1, &r) != X_ERROR_SUCCESS);
-  CHECK(r.reason == "changed at the last moment");
-  ExpectUnchanged(slot, Content(9));
+  slot.Stage(Content(2), "child");
+  REQUIRE(RunChild(Spec("import", slot, "I6")) == kHitCode);  // prepared, the live file still old
+  {
+    // The live file held open with no sharing while the next start recovers: unreadable now.
+    HANDLE held = CreateFileW(slot.live.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(held != INVALID_HANDLE_VALUE);
+    { ContentManager cm(nullptr, slot.root); }
+    CloseHandle(held);
+  }
+  CHECK(fs::exists(slot.ImportDir()));  // kept, not orphaned
+  CHECK_FALSE(HasOrphan(slot));
+  { ContentManager cm(nullptr, slot.root); }  // readable again: settled (did not happen)
+  ExpectUnchanged(slot, Content(1));
   RemoveRoot(slot.root);
 }
 
-TEST_CASE("a stop between the install's two moves puts the old file back at restart",
-          "[save_import][save_to_host][fault]") {
-  StopImportAt("displaced", /*want_new=*/false);
+TEST_CASE("a header changed under an unfinished import is orphaned and the slot left as it is",
+          "[save_import][save_to_host][recovery]") {
+  Slot slot;
+  slot.Stage(Content(2), "child");
+  REQUIRE(RunChild(Spec("import", slot, "I6")) == kHitCode);
+  auto other_header = slot.header_bytes;
+  other_header[0] ^= 0x01;
+  PutFile(slot.header, other_header);
+  { ContentManager cm(nullptr, slot.root); }
+  CHECK(GetFile(slot.live) == Content(1));
+  CHECK(GetFile(slot.header) == other_header);
+  CHECK(HasOrphan(slot));  // the journal kept as evidence
+  RemoveRoot(slot.root);
 }
 
 TEST_CASE("the header is bound too", "[save_import][save_to_host]") {

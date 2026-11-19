@@ -230,6 +230,39 @@ bool HashFile(const std::filesystem::path& path, Sha256* sha, uint64_t* size = n
   return Sha256Of(bytes, sha);
 }
 
+// Whether a record's paths belong to the import folder `id` (its package's folder, separators as '_',
+// as ContentManager names it) and stay below the content root: relative, no `..`, no drive.
+bool RecordNamesSlot(const ImportTxn& txn, const std::string& id) {
+  for (const std::string* p : {&txn.package, &txn.header}) {
+    if (p->empty() || p->find("..") != std::string::npos || p->find(':') != std::string::npos ||
+        p->front() == '/' || p->front() == '\\') {
+      return false;
+    }
+  }
+  const size_t slash = txn.package.find_last_of("/\\");
+  if (slash == std::string::npos) return false;
+  std::string folder = txn.package.substr(0, slash);
+  for (char& c : folder) {
+    if (c == '/' || c == '\\') c = '_';
+  }
+  return folder == id;
+}
+
+// Every path element below `root` down to `target` (online_save_to_host, checked under the lock right
+// before the replace): each exists and is a plain folder or file, none a reparse point (a junction, a
+// symbolic link, a mount point). False on any error, a missing element or a target outside `root`.
+bool PlainChain(const std::filesystem::path& root, const std::filesystem::path& target) {
+  const std::filesystem::path rel = target.lexically_normal().lexically_relative(root.lexically_normal());
+  if (rel.empty() || rel.is_absolute() || *rel.begin() == L"..") return false;
+  std::filesystem::path p = root;
+  for (const auto& part : rel) {
+    p /= part;
+    const DWORD a = GetFileAttributesW(p.c_str());
+    if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
+  }
+  return true;
+}
+
 std::filesystem::path TmpOf(const std::filesystem::path& path) {
   std::filesystem::path tmp = path;
   tmp += L".tmp";
@@ -568,14 +601,15 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
 
   // ---- Step 5: the install, under the lock. ----
   const auto new_file = dir / L"new.xsg";
-  // The live file is first moved aside into the folder (displaced.xsg) and hashed there, then the new
-  // file is moved in with no replace (online_save_to_host, design draft 5 sec. 8): a writer outside
-  // this process that changed the live file after the hash check above (an uncooperative writer; a
-  // cooperating one is kept off by the slot write lock) is found here, its file put back and the
-  // import refused, instead of being replaced unseen. A stop between the two moves leaves the live
-  // file absent and displaced.xsg in the folder: Recover puts it back.
-  const auto displaced = dir / L"displaced.xsg";
-  enum class Check { kNone, kOpen, kPending, kPendingStatus, kBase, kChanged, kDisplaced };
+  // One atomic replace of the live data file (MoveFileExW REPLACE_EXISTING | WRITE_THROUGH of a file
+  // written, flushed and hashed in the import folder): the live name is never absent, so every stop
+  // leaves the old file or the new one whole. The header is never written by an import (D7); with
+  // check_header (online_save_to_host) both files are hashed again under the lock right before the
+  // replace and every path component below the content root must be a plain folder or file (no
+  // junction or link put in the way since the binding). What changes the file in the moment between
+  // that check and the rename is a documented residual race: a writer of this build is kept off by the
+  // slot write lock, a writer of another build or program is not.
+  enum class Check { kNone, kOpen, kPending, kPendingStatus, kBase, kHeader, kPath };
   Check failed = Check::kNone;
   uint32_t rename_err = 0;
   for (int attempt = 0; attempt < 4; ++attempt) {
@@ -591,53 +625,33 @@ X_RESULT SaveImportJournal::Import(const Request& rq, const LockedRunner& locked
         failed = pending_now == PathState::kError ? Check::kPendingStatus : Check::kPending;
         return kErrBusy;
       }
+      if (rq.check_header && (!PlainChain(root_, rq.package_file) || !PlainChain(root_, rq.header_file) ||
+                              !PlainChain(root_, new_file))) {
+        failed = Check::kPath;
+        return kErrMismatch;
+      }
       Sha256 now{};
       if (!HashFile(rq.package_file, &now) || now != rq.base_sha) {
         failed = Check::kBase;
         return kErrMismatch;
       }
-      if (uint32_t err = RunImportFaultPoint("install")) return err;
-      if (!MoveFileExW(rq.package_file.c_str(), displaced.c_str(), MOVEFILE_WRITE_THROUGH)) {
-        return GetLastError();  // nothing moved: retried
-      }
-      Sha256 moved{};
-      if (!HashFile(displaced, &moved) || moved != rq.base_sha) {
-        // Changed between the check and the move: put it back as it is, refuse.
-        if (MoveFileExW(displaced.c_str(), rq.package_file.c_str(), MOVEFILE_WRITE_THROUGH)) {
-          failed = Check::kChanged;
+      if (rq.check_header) {
+        Sha256 header_now{};
+        if (!HashFile(rq.header_file, &header_now) || header_now != rq.base_header_sha) {
+          failed = Check::kHeader;
           return kErrMismatch;
         }
-        failed = Check::kDisplaced;
+      }
+      if (uint32_t err = RunImportFaultPoint("install")) return err;
+      if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         return GetLastError();
-      }
-      if (uint32_t err = RunImportFaultPoint("displaced")) {
-        if (MoveFileExW(displaced.c_str(), rq.package_file.c_str(), MOVEFILE_WRITE_THROUGH)) return err;
-        failed = Check::kDisplaced;
-        return err;
-      }
-      if (!MoveFileExW(new_file.c_str(), rq.package_file.c_str(), MOVEFILE_WRITE_THROUGH)) {
-        const uint32_t err = GetLastError();
-        // A file appeared at the live path (another writer) or the move failed: the old file goes
-        // back only to an empty place; otherwise both stay for recovery.
-        if (MoveFileExW(displaced.c_str(), rq.package_file.c_str(), MOVEFILE_WRITE_THROUGH)) return err;
-        failed = Check::kDisplaced;
-        return err;
       }
       return 0;
     });
     if (rename_err == 0 || failed != Check::kNone) break;
   }
-  if (failed == Check::kDisplaced) {
-    unresolved_.insert(rq.id);
-    report->reason = "displaced";
-    REXSYS_ERROR("Content: the import of {} seq {} moved the live file aside and could not finish or undo it "
-                 "({}); the next start settles it",
-                 rq.id, rq.seq, rename_err);
-    return X_ERROR_IO_INCOMPLETE;
-  }
-  if (failed == Check::kChanged) {
-    return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "changed at the last moment", report);
-  }
+  if (failed == Check::kPath) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "a link on the path", report);
+  if (failed == Check::kHeader) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "header differs", report);
   if (failed == Check::kOpen) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "open", report);
   if (failed == Check::kPending) return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "native pending", report);
   if (failed == Check::kPendingStatus) {
@@ -774,30 +788,37 @@ void SaveImportJournal::RecoverLocked() {
                    rex::path_to_utf8(dir), txn_err);
       continue;
     }
+    bool keep = false;  // a file of the pair could not be read now: settle nothing, try at the next start
     if (txn_state == PathState::kMissing) {
       decision = Decision::kDiscard;  // a stop before I6: the install never ran
     } else if (ReadWholeFile(txn_path, &text) == 0 &&
                ParseImportTxn(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()),
                               &txn)) {
-      // A stop between the install's two moves (online_save_to_host): the live file absent and the
-      // old one in the folder as displaced.xsg. It goes back first, so the decision below reads the
-      // old file (did not happen). A displaced file of another hash, or a live file that is there,
-      // is left alone: the decision then reads what is live (or orphans).
-      const auto live_path = root_ / rex::to_path(txn.package);
-      const auto displaced_path = dir / L"displaced.xsg";
-      if (StatusOf(live_path) == PathState::kMissing && StatusOf(displaced_path) == PathState::kOther) {
-        Sha256 moved{};
-        if (HashFile(displaced_path, &moved) && moved == txn.old_sha &&
-            MoveFileExW(displaced_path.c_str(), live_path.c_str(), MOVEFILE_WRITE_THROUGH)) {
-          REXSYS_INFO("Content: the import of {} seq {} stopped between its two moves; the old file is back", id,
-                      txn.seq);
+      // The record must name this folder's own slot (its package's folder is the folder's id) and
+      // stay below the content root: a record naming anything else is never acted on (orphaned).
+      // Then both files of the pair decide (online_save_to_host, files review 5): the header must be
+      // the transaction's (an import never writes it), and the data file the old one (did not happen:
+      // the journal goes) or the new one (finished: the journal is kept as previous-import). A file
+      // that cannot be read now keeps the folder untouched for the next start (never orphaned for a
+      // transient error); a readable pair that is neither is orphaned, the journal kept as evidence.
+      if (RecordNamesSlot(txn, id)) {
+        const auto live_path = root_ / rex::to_path(txn.package);
+        const auto header_path = root_ / rex::to_path(txn.header);
+        Sha256 live{}, header{};
+        if (!HashFile(live_path, &live) || !HashFile(header_path, &header)) {
+          keep = true;
+        } else if (header == txn.header_sha) {
+          if (live == txn.new_sha) decision = Decision::kFinish;
+          else if (live == txn.old_sha) decision = Decision::kDiscard;
         }
       }
-      Sha256 live{};
-      if (HashFile(live_path, &live)) {
-        if (live == txn.new_sha) decision = Decision::kFinish;
-        else if (live == txn.old_sha) decision = Decision::kDiscard;
-      }
+    }
+    if (keep) {
+      unresolved_.insert(id);
+      REXSYS_ERROR("Content: the import folder {} is not settled: its save or header cannot be read now; it is "
+                   "kept and imports of it are refused until a start can read them",
+                   rex::path_to_utf8(dir));
+      continue;
     }
     switch (decision) {
       case Decision::kFinish:
