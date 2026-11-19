@@ -1232,7 +1232,7 @@ TEST_CASE("a host import is refused unless armed", "[save_import][save_to_host][
   RemoveRoot(slot.root);
 }
 
-TEST_CASE("disarmed at the binding's end, the legacy path again; never while a staged save is open",
+TEST_CASE("disarmed at the binding's end, always: the legacy path again, no stage routing",
           "[save_import][save_to_host][off]") {
   Slot slot;
   ContentManager cm(nullptr, slot.root);
@@ -1243,7 +1243,7 @@ TEST_CASE("disarmed at the binding's end, the legacy path again; never while a s
   data.title_id = kTitle;
   SetSaveToHostArmed();
   cm.SetBoundSavedGame(kXuid, kTitle, "SWAPFORCE_1");
-  // A staged save still open keeps the process armed (its late operations must reach its stage).
+  // An arm still live at the binding's end is dropped with it (M2): nothing is routed to a stage later.
   ContentManager::StagedSaveTarget t;
   t.xuid = kXuid;
   t.title_id = kTitle;
@@ -1251,16 +1251,15 @@ TEST_CASE("disarmed at the binding's end, the legacy path again; never while a s
   t.stage_dir = slot.root / "stage";
   const uint64_t token = cm.ArmStagedSave(t);
   REQUIRE(token != 0);
-  CHECK_FALSE(cm.DisarmSaveToHost());
-  CHECK(SaveToHostArmed());
-  CHECK_FALSE(cm.IsBoundLiveSavedGame(kXuid, data));  // the binding itself is gone
   // A lock taken while armed (another slot's native write) is given back after the disarm too.
   XCONTENT_AGGREGATE_DATA other = data;
   other.set_file_name("SWAPFORCE_2");
   REQUIRE(cm.AcquireSaveWriteLock("other", kXuid, other));
-  CHECK(cm.DisarmStagedSave(token));
-  CHECK(cm.DisarmSaveToHost());
+  cm.DisarmSaveToHost();
   CHECK_FALSE(SaveToHostArmed());
+  CHECK_FALSE(cm.IsBoundLiveSavedGame(kXuid, data));  // the binding itself is gone
+  CHECK(cm.StagedSaveStatus(token) == ContentManager::StagedSaveState::kNone);  // the arm is gone
+  CHECK(cm.ResolveLivePackagePath(kXuid, data) == slot.live.parent_path());
   auto locks = [&] {
     size_t n = 0;
     std::error_code ec;

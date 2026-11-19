@@ -273,12 +273,11 @@ class ContentManager {
   // OPEN_ALWAYS through XamContentCreate, XamContentDelete, unmount-and-delete).
   void SetBoundSavedGame(uint64_t xuid, uint32_t title_id, const std::string& file_name);
   void ClearBoundSavedGame();
-  // The binding's end (re-check N8, off means off over time): the bound slot cleared and the process
-  // disarmed, so every saved-game path is the legacy one again (no lock made, waited for or refused).
-  // false, and still armed, while a staged save is still open: its late file operations must still go to
-  // its stage, never the live slot (saving was stopped for that session already). Locks taken while armed
-  // are still given back at their close.
-  bool DisarmSaveToHost();
+  // The binding's end (re-check N8 and the file-safety re-check M2): the bound slot cleared, every
+  // staged-save arm dropped and the process disarmed, always, so every saved-game path is the legacy one
+  // again and nothing of a later session is routed into a stage folder. A staged write still open keeps
+  // its own mount (its stage folder); locks taken while armed are still given back at their close.
+  void DisarmSaveToHost();
   // Armed, and `data` is the bound slot's live content (not a staged save): such a write is refused.
   bool IsBoundLiveSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;
   void ReleaseSaveWriteLock(const std::string_view root_name);

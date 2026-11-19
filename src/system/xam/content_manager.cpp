@@ -1057,16 +1057,19 @@ void ContentManager::ClearBoundSavedGame() {
   bound_ = StagedSaveTarget{};
 }
 
-bool ContentManager::DisarmSaveToHost() {
+void ContentManager::DisarmSaveToHost() {
   std::lock_guard lock(staged_mutex_);
   bound_set_ = false;
   bound_ = StagedSaveTarget{};
+  // Every arm goes with the binding (the file-safety re-check M2): no create or open of any later session
+  // is ever routed into a stage folder. A staged write still open keeps its mount (made at its open, on
+  // its stage folder), so its late writes and its close stay in that folder, never the live slot.
   if (!staged_arms_.empty()) {
-    REXSYS_WARN("Content: save to host stays armed: {} staged save(s) still open", staged_arms_.size());
-    return false;
+    REXSYS_WARN("Content: {} staged save(s) dropped at the binding's end; nothing is routed to a stage any more",
+                staged_arms_.size());
   }
+  staged_arms_.clear();
   ClearSaveToHostArmed();
-  return true;
 }
 
 bool ContentManager::IsBoundLiveSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const {
