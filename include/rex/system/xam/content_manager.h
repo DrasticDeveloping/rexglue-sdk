@@ -243,21 +243,41 @@ class ContentManager {
   void RecoverHostImports();
 
   // ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ----------------------
-  // A staged save: while an arm is live, every operation on that exact saved game (profile, title,
-  // file name) resolves to `stage_dir` instead of the live package: ContentExists, CreateContent,
-  // OpenContent and its mount, the header WriteContentHeaderFile writes, CloseContent; ReplaceContent
-  // and DeleteContent of it touch nothing live. ListContent and ReadContentHeaderFile keep reading the
-  // live files. One arm per saved game; the arm is named by its token, which follows the operation
-  // through a deferred XamContentCreate as well (the arm, not the thread, decides).
+  // A staged save (the file-safety re-check M4): an arm names its binding (epoch, session), its stage
+  // folder and that folder's own name. It is taken by exactly one XamContentCreate call, the first of
+  // that saved game (profile, title, file name) after it was armed (StagedClaim, for that call's whole
+  // run, also when the call is deferred to another thread); only inside that call do ContentExists,
+  // CreateContent, OpenContent and its mount, ReplaceContent and the header WriteContentHeaderFile writes
+  // resolve to the stage. Any other operation, every delete included, resolves to the live package (and,
+  // for the bound slot, is refused). ListContent and ReadContentHeaderFile keep reading the live files.
   struct StagedSaveTarget {
     uint64_t xuid = 0;
     uint32_t title_id = 0;
     std::string file_name;          // SWAPFORCE_<n>
     std::filesystem::path stage_dir;  // an empty folder the caller made
+    uint64_t epoch = 0;             // the caller's binding epoch the stage belongs to
+    uint64_t session = 0;           // the session it belongs to
+    std::string stage_name;         // the stage folder's own name: stage_dir must end in exactly it
   };
   enum class StagedSaveState : uint8_t { kNone, kArmed, kOpen, kClosed };
-  // A token, or 0 when an arm for that saved game is live already (an overlapping save).
+  // A token, or 0 when an arm for that saved game is live already (an overlapping save), the process is
+  // not armed, or the stage folder's name is not the target's stage_name.
   uint64_t ArmStagedSave(const StagedSaveTarget& target);
+  // The claim of an arm by one XamContentCreate call: the first call for the armed saved game takes it;
+  // while the claim lives (that call's run, on that thread), resolution of that saved game goes to the
+  // stage. Not armed: one load, nothing claimed.
+  class StagedClaim {
+   public:
+    StagedClaim(ContentManager* cm, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+    ~StagedClaim();
+    StagedClaim(const StagedClaim&) = delete;
+    StagedClaim& operator=(const StagedClaim&) = delete;
+
+   private:
+    uint64_t previous_ = 0;
+    bool set_ = false;
+  };
+  uint64_t ClaimStagedSave(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   StagedSaveState StagedSaveStatus(uint64_t token) const;
   // Ends an arm that never opened or that closed; an open arm is ended by its close. False: still open.
   bool DisarmStagedSave(uint64_t token);
@@ -294,7 +314,9 @@ class ContentManager {
     uint64_t token = 0;
     StagedSaveTarget target;
     StagedSaveState state = StagedSaveState::kArmed;
+    bool claimed = false;  // taken by one XamContentCreate call (StagedClaim)
   };
+  bool StagedIdentityLocked(const StagedArm& arm, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;
   // The live arm for a saved game, or nullptr. staged_mutex_ held.
   const StagedArm* MatchStagedLocked(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;
   std::optional<std::filesystem::path> StagedPackagePath(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) const;

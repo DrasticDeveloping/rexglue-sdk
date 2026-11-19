@@ -144,6 +144,9 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
   auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
               disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    // online_save_to_host (the file-safety re-check M4): this call takes the staged-save arm of its saved
+    // game, if one waits, for its whole run; no other call is ever routed to that stage. Not armed: one load.
+    ContentManager::StagedClaim staged_claim(content_manager, xuid, content_data);
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
     switch (flags & 0xF) {

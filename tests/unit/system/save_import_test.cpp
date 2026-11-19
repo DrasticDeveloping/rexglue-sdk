@@ -1249,6 +1249,7 @@ TEST_CASE("disarmed at the binding's end, always: the legacy path again, no stag
   t.title_id = kTitle;
   t.file_name = "SWAPFORCE_1";
   t.stage_dir = slot.root / "stage";
+  t.stage_name = "stage";
   const uint64_t token = cm.ArmStagedSave(t);
   REQUIRE(token != 0);
   // A lock taken while armed (another slot's native write) is given back after the disarm too.
@@ -1351,13 +1352,18 @@ TEST_CASE("a staged save resolves to its stage and never touches the live packag
   SetSaveToHostArmed();
   Slot slot;
   ContentManager cm(nullptr, slot.root);
-  const fs::path stage = slot.root / "Online" / "outbox" / "1";
+  const fs::path stage = slot.root / "Online" / "outbox" / "1-1-1";
   fs::create_directories(stage);
   ContentManager::StagedSaveTarget t;
   t.xuid = kXuid;
   t.title_id = kTitle;
   t.file_name = "SWAPFORCE_1";
   t.stage_dir = stage;
+  t.epoch = 1;
+  t.session = 1;
+  t.stage_name = "another";
+  CHECK(cm.ArmStagedSave(t) == 0);  // the folder's own name must be the target's
+  t.stage_name = "1-1-1";
   const uint64_t token = cm.ArmStagedSave(t);
   REQUIRE(token != 0);
   CHECK(cm.ArmStagedSave(t) == 0);  // an overlapping save of the same slot
@@ -1367,9 +1373,19 @@ TEST_CASE("a staged save resolves to its stage and never touches the live packag
   data.set_file_name("SWAPFORCE_1");
   data.xuid = kXuid;
   data.title_id = kTitle;
-  CHECK_FALSE(cm.ContentExists(kXuid, data));                         // the stage is empty
-  CHECK(cm.ReplaceContent("save", kXuid, data) == X_ERROR_SUCCESS);   // moves nothing live
-  CHECK(cm.WriteContentHeaderFile(kXuid, data) == X_ERROR_SUCCESS);    // into the stage
+  // Outside the claiming call, the same saved game resolves live (identity alone routes nothing).
+  CHECK(cm.ContentExists(kXuid, data));
+  {
+    ContentManager::StagedClaim claim(&cm, kXuid, data);  // the save's own call
+    {
+      ContentManager::StagedClaim second(&cm, kXuid, data);  // a second call claims nothing
+    }
+    CHECK_FALSE(cm.ContentExists(kXuid, data));                         // the stage is empty
+    CHECK(cm.ReplaceContent("save", kXuid, data) == X_ERROR_SUCCESS);   // moves nothing live
+    CHECK(cm.WriteContentHeaderFile(kXuid, data) == X_ERROR_SUCCESS);    // into the stage
+  }
+  CHECK(cm.ContentExists(kXuid, data));  // the call ended: live again for everyone else
+  // A delete is never staged: outside the call it is the live package's (and the bound slot's is refused).
   CHECK(fs::exists(stage / "SWAPFORCE_1.header"));
   CHECK(GetFile(slot.live) == Content(1));
   CHECK(GetFile(slot.header) == slot.header_bytes);

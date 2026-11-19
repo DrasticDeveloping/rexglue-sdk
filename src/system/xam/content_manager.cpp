@@ -44,6 +44,10 @@ namespace system {
 namespace xam {
 
 namespace {
+// online_save_to_host (the file-safety re-check M4): the staged-save arm the running XamContentCreate call
+// claimed (0: none); only that call's resolution goes to its stage.
+thread_local uint64_t t_staged_claim = 0;
+
 bool SameFileName(std::string_view a, std::string_view b) {
   if (a.size() != b.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) {
@@ -670,8 +674,6 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
   uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
   auto header_path =
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
-  // online_save_to_host: a staged save's delete removes its stage's header, never the live one.
-  if (auto staged = StagedHeaderPath(xuid, data)) header_path = *staged;
   std::error_code ec2;
   bool header_removed = std::filesystem::remove(header_path, ec2);
 
@@ -904,7 +906,9 @@ X_RESULT ContentManager::ImportSavedGame(const SaveImportBinding& binding,
     if (!slot_lock) return refuse(X_ERROR_ACCESS_DENIED, "slot locked");
     return host_import_journal_.Import(request, locked, report);
   }
-  // The 1C import: the online branch's journal, no lock, no wait.
+  // The 1C import: the online branch's journal, no lock, no wait; refused for a slot a session binds
+  // (the file-safety re-check M4; not armed: false at once).
+  if (IsBoundLiveSavedGame(binding.xuid, data)) return refuse(X_ERROR_ACCESS_DENIED, "bound slot");
   return import_journal_.Import(
       request,
       [this, &data](const std::function<uint32_t(bool)>& body) {
@@ -948,19 +952,50 @@ void ContentManager::RecoverHostImports() { host_import_journal_.Recover(); }
 // ---- Swap Force Online online_save_to_host (design draft 5, sec. 6 and 8) ---------------------------
 
 
-const ContentManager::StagedArm* ContentManager::MatchStagedLocked(uint64_t xuid,
-                                                                   const XCONTENT_AGGREGATE_DATA& data) const {
-  if (staged_arms_.empty() || data.content_type != XContentType::kSavedGame) return nullptr;
+bool ContentManager::StagedIdentityLocked(const StagedArm& arm, uint64_t xuid,
+                                          const XCONTENT_AGGREGATE_DATA& data) const {
+  if (data.content_type != XContentType::kSavedGame) return false;
   const uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
   const uint32_t title =
       (data.title_id == kCurrentlyRunningTitleId && kernel_state_) ? kernel_state_->title_id() : uint32_t(data.title_id);
-  const std::string name = data.file_name();
+  return arm.target.xuid == used_xuid && arm.target.title_id == title && SameFileName(arm.target.file_name, data.file_name());
+}
+
+// The arm the running XamContentCreate call claimed, when it is for this saved game; nullptr otherwise
+// (the file-safety re-check M4: identity alone never routes to a stage).
+const ContentManager::StagedArm* ContentManager::MatchStagedLocked(uint64_t xuid,
+                                                                   const XCONTENT_AGGREGATE_DATA& data) const {
+  if (staged_arms_.empty() || t_staged_claim == 0) return nullptr;
   for (const StagedArm& arm : staged_arms_) {
-    if (arm.target.xuid == used_xuid && arm.target.title_id == title && SameFileName(arm.target.file_name, name)) {
-      return &arm;
-    }
+    if (arm.token == t_staged_claim && arm.claimed && StagedIdentityLocked(arm, xuid, data)) return &arm;
   }
   return nullptr;
+}
+
+uint64_t ContentManager::ClaimStagedSave(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  if (!SaveToHostArmed()) return 0;  // not armed: one load
+  std::lock_guard lock(staged_mutex_);
+  for (StagedArm& arm : staged_arms_) {
+    if (!arm.claimed && arm.state == StagedSaveState::kArmed && StagedIdentityLocked(arm, xuid, data)) {
+      arm.claimed = true;
+      REXSYS_INFO("Content: the staged save {} (session {}, epoch {}) is taken by this save", arm.target.stage_name,
+                  arm.target.session, arm.target.epoch);
+      return arm.token;
+    }
+  }
+  return 0;
+}
+
+ContentManager::StagedClaim::StagedClaim(ContentManager* cm, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  const uint64_t token = cm ? cm->ClaimStagedSave(xuid, data) : 0;
+  if (!token) return;
+  previous_ = t_staged_claim;
+  t_staged_claim = token;
+  set_ = true;
+}
+
+ContentManager::StagedClaim::~StagedClaim() {
+  if (set_) t_staged_claim = previous_;
 }
 
 std::optional<std::filesystem::path> ContentManager::StagedPackagePath(uint64_t xuid,
@@ -997,6 +1032,8 @@ void ContentManager::NoteStagedPackage(const std::filesystem::path& package_path
 uint64_t ContentManager::ArmStagedSave(const StagedSaveTarget& target) {
   if (!SaveToHostArmed()) return 0;  // staged saves exist only in an armed process
   if (target.file_name.empty() || target.stage_dir.empty() || target.xuid == 0) return 0;
+  // The stage folder's own name (M4): the arm names exactly that folder.
+  if (target.stage_name.empty() || target.stage_dir.filename() != rex::to_path(target.stage_name)) return 0;
   std::lock_guard lock(staged_mutex_);
   if (!SaveToHostArmed()) return 0;  // disarmed meanwhile (DisarmSaveToHost holds this lock)
   for (const StagedArm& arm : staged_arms_) {
@@ -1005,6 +1042,7 @@ uint64_t ContentManager::ArmStagedSave(const StagedSaveTarget& target) {
       return 0;  // an overlapping save of the same saved game: refused, the first keeps its arm
     }
   }
+  REXSYS_INFO("Content: staged save {} armed (session {}, epoch {})", target.stage_name, target.session, target.epoch);
   StagedArm arm;
   arm.token = ++next_staged_token_;
   arm.target = target;
