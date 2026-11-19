@@ -136,6 +136,11 @@ bool Entry::Delete() {
 }
 
 X_STATUS Entry::Rename(const std::filesystem::path& file_path) {
+  // A read-only device renames nothing (as it creates, deletes and truncates nothing): online_save_to_host
+  // mounts a bound slot read-only (content_manager.cpp, the file-safety re-check M3).
+  if (is_read_only()) {
+    return X_STATUS_ACCESS_DENIED;
+  }
   // Store the string so split path string_views remain valid.
   const std::string path_str = rex::path_to_utf8(file_path);
   std::vector<std::string_view> path_parts = rex::string::utf8_split_path(path_str);

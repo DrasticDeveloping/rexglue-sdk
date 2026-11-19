@@ -123,8 +123,10 @@ static_assert_size(XCONTENT_AGGREGATE_DATA, 0x148);
 
 class ContentPackage {
  public:
+  // `read_only` (online_save_to_host, the file-safety re-check M3): the mount refuses every write.
   ContentPackage(KernelState* kernel_state, const std::string_view root_name,
-                 const XCONTENT_AGGREGATE_DATA& data, const std::filesystem::path& package_path);
+                 const XCONTENT_AGGREGATE_DATA& data, const std::filesystem::path& package_path,
+                 bool read_only = false);
   ~ContentPackage();
 
   void LoadPackageLicenseMask(const std::filesystem::path header_path);

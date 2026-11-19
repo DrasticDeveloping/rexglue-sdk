@@ -103,13 +103,13 @@ std::string PackageId(const std::filesystem::path& relative_package_path) {
 
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
-                               const std::filesystem::path& package_path)
+                               const std::filesystem::path& package_path, bool read_only)
     : kernel_state_(kernel_state), root_name_(root_name), package_path_(package_path), license_(0) {
   device_path_ = fmt::format("\\Device\\Content\\{0}\\", ++content_device_id_);
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, read_only,
                                                                   /*allow_share_delete=*/true);
   device->Initialize();
   fs->RegisterDevice(std::move(device));
@@ -255,7 +255,12 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
   if (!std::filesystem::exists(package_path)) {
     return nullptr;
   }
-  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
+  // online_save_to_host (the file-safety re-check M3): while a session binds the slot, its live content
+  // mounts read-only for everything but its staged save (which resolves to its stage, not here): a guest
+  // write, create, truncate, delete, delete-on-close, rename, attribute or time change on the mounted
+  // content is refused. Not armed: false at once (one load), the mount as before.
+  const bool read_only = IsBoundLiveSavedGame(xuid, data);
+  auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path, read_only);
   return package;
 }
 
@@ -623,6 +628,11 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
 
 X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                              std::vector<uint8_t> buffer) {
+  if (IsBoundLiveSavedGame(xuid, data)) {  // online_save_to_host (M3): the bound slot is the session's
+    REXSYS_ERROR("Content: writing the thumbnail of the bound save {} is refused while a session saves to it",
+                 data.file_name());
+    return X_ERROR_ACCESS_DENIED;
+  }
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
   std::filesystem::create_directories(package_path);

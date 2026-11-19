@@ -1405,6 +1405,22 @@ TEST_CASE("a load of the slot waits for the slot write lock an import holds", "[
   RemoveRoot(slot.root);
 }
 
+TEST_CASE("armed, the bound slot refuses its thumbnail write", "[save_import][save_to_host]") {
+  ArmedGuard armed;
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  XCONTENT_AGGREGATE_DATA data{};
+  data.content_type = XContentType::kSavedGame;
+  data.set_file_name("SWAPFORCE_1");
+  data.xuid = kXuid;
+  data.title_id = kTitle;
+  cm.SetBoundSavedGame(kXuid, kTitle, "SWAPFORCE_1");
+  CHECK(cm.SetContentThumbnail(kXuid, data, {1, 2, 3}) == X_ERROR_ACCESS_DENIED);
+  CHECK_FALSE(fs::exists(slot.live.parent_path() / "__thumbnail.png"));
+  cm.DisarmSaveToHost();
+  RemoveRoot(slot.root);
+}
+
 TEST_CASE("armed, the bound slot refuses every native write but its staged save", "[save_import][save_to_host]") {
   SetSaveToHostArmed();
   Slot slot;
