@@ -1005,6 +1005,11 @@ void ContentManager::AcquireSaveWriteLock(const std::string_view root_name, uint
   write_locks_.insert_or_assign(string::string_key_case::create(root_name), std::move(lock));
 }
 
+std::unique_ptr<SlotWriteLock> ContentManager::LockSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+                                                             std::chrono::milliseconds wait) {
+  return SlotWriteLock::Acquire(root_path_, PackageIdOfPath(ResolveLivePackagePath(xuid, data)), wait);
+}
+
 void ContentManager::ReleaseSaveWriteLock(const std::string_view root_name) {
   std::unique_ptr<SlotWriteLock> lock;
   {

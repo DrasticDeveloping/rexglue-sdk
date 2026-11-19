@@ -255,6 +255,11 @@ class ContentManager {
   // then goes on without it and logs (offline play never fails on the lock).
   void AcquireSaveWriteLock(const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   void ReleaseSaveWriteLock(const std::string_view root_name);
+  // The slot write lock of a saved game's live package, for a reader that must never see a file the
+  // import is replacing (the game's load of the bound slot during a session): waits up to `wait`;
+  // nullptr when another holder kept it for the whole wait.
+  std::unique_ptr<SlotWriteLock> LockSavedGame(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+                                               std::chrono::milliseconds wait);
 
  private:
   struct StagedArm {

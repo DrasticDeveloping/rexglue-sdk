@@ -1181,4 +1181,23 @@ TEST_CASE("a staged save resolves to its stage and never touches the live packag
   RemoveRoot(slot.root);
 }
 
+TEST_CASE("a load of the slot waits for the slot write lock an import holds", "[save_import][save_to_host]") {
+  Slot slot;
+  ContentManager cm(nullptr, slot.root);
+  XCONTENT_AGGREGATE_DATA data{};
+  data.content_type = XContentType::kSavedGame;
+  data.set_file_name("SWAPFORCE_1");
+  data.xuid = kXuid;
+  data.title_id = kTitle;
+  {
+    auto import_holds = SlotWriteLock::Acquire(slot.root, kId, std::chrono::milliseconds(0));
+    REQUIRE(import_holds != nullptr);
+    CHECK(cm.LockSavedGame(kXuid, data, std::chrono::milliseconds(100)) == nullptr);  // the load waits, then fails
+  }
+  auto load = cm.LockSavedGame(kXuid, data, std::chrono::milliseconds(0));
+  CHECK(load != nullptr);  // released: the load goes on
+  load.reset();
+  RemoveRoot(slot.root);
+}
+
 #endif  // REX_PLATFORM_WIN32
