@@ -1341,6 +1341,27 @@ TEST_CASE("the slot write lock has one holder across handles", "[save_import][sa
   RemoveRoot(root);
 }
 
+TEST_CASE("pinned folders cannot be renamed; links and second names are not plain", "[save_import][save_to_host]") {
+  Slot slot;
+  const fs::path dir = slot.live.parent_path();
+  std::string why;
+  {
+    auto pin = PinnedChain::Pin({dir}, &why);
+    REQUIRE(pin != nullptr);
+    CHECK(pin->Handle(dir) != nullptr);
+    const fs::path moved = dir.parent_path() / "moved";
+    CHECK_FALSE(MoveFileExW(dir.c_str(), moved.c_str(), 0));  // held: no rename, no junction swap
+  }
+  CHECK(PlainFile(slot.live));
+  const fs::path second = slot.root / "second.xsg";
+  REQUIRE(CreateHardLinkW(second.c_str(), slot.live.c_str(), nullptr));
+  CHECK_FALSE(PlainFile(slot.live));  // two names: not plain
+  fs::remove(second);
+  CHECK(PlainFile(slot.live));
+  CHECK_FALSE(PlainFile(slot.root / "missing.xsg"));
+  RemoveRoot(slot.root);
+}
+
 TEST_CASE("a host import is refused while another holder has the slot write lock", "[save_import][save_to_host]") {
   ArmedGuard armed;
   HookGuard hook;

@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <ctime>
+#include <cwctype>
 
 #include <fmt/format.h>
 
@@ -779,20 +780,89 @@ bool RecordNamesSlot(const ImportTxn& txn, const std::string& id) {
   return folder == id;
 }
 
-// Every path element below `root` down to `target`: each exists and is no reparse point.
-bool PlainChain(const std::filesystem::path& root, const std::filesystem::path& target) {
-  const std::filesystem::path rel = target.lexically_normal().lexically_relative(root.lexically_normal());
-  if (rel.empty() || rel.is_absolute() || *rel.begin() == L"..") return false;
-  std::filesystem::path p = root;
-  for (const auto& part : rel) {
-    p /= part;
-    const DWORD a = GetFileAttributesW(p.c_str());
-    if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
+struct OwnedHandle {
+  HANDLE h = INVALID_HANDLE_VALUE;
+  OwnedHandle() = default;
+  explicit OwnedHandle(HANDLE handle) : h(handle) {}
+  OwnedHandle(const OwnedHandle&) = delete;
+  OwnedHandle& operator=(const OwnedHandle&) = delete;
+  ~OwnedHandle() {
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
   }
-  return true;
+  explicit operator bool() const { return h != INVALID_HANDLE_VALUE; }
+};
+
+// A file's identity and kind through its own handle.
+bool InfoOf(HANDLE h, BY_HANDLE_FILE_INFORMATION* info) { return GetFileInformationByHandle(h, info) != 0; }
+
+// A plain file through its handle: no reparse point, not a folder, exactly one name (no hard link).
+bool PlainFileHandle(HANDLE h) {
+  BY_HANDLE_FILE_INFORMATION info{};
+  return InfoOf(h, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
+         (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 && info.nNumberOfLinks == 1;
 }
 
 }  // namespace
+
+bool PlainFile(const std::filesystem::path& path) {
+  OwnedHandle h(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  return h && PlainFileHandle(h.h);
+}
+
+std::unique_ptr<PinnedChain> PinnedChain::Pin(const std::vector<std::filesystem::path>& dirs, std::string* why) {
+  std::unique_ptr<PinnedChain> pin(new PinnedChain());
+  auto fail = [&](const std::string& w) -> std::unique_ptr<PinnedChain> {
+    if (why) *why = w;
+    return nullptr;
+  };
+  for (const auto& target : dirs) {
+    const std::filesystem::path full = target.lexically_normal();
+    if (!full.is_absolute() || !full.has_root_name()) return fail("not an absolute path: " + rex::path_to_utf8(full));
+    std::filesystem::path p = full.root_name() / full.root_directory();
+    std::vector<std::filesystem::path> chain{p};
+    for (const auto& part : full.relative_path()) {
+      if (part.empty()) continue;
+      p /= part;
+      chain.push_back(p);
+    }
+    for (size_t i = 0; i < chain.size(); ++i) {
+      std::wstring key = chain[i].wstring();
+      for (auto& c : key) c = wchar_t(std::towlower(c));
+      if (pin->paths_.count(key)) continue;
+      const bool last = i + 1 == chain.size();
+      // No FILE_SHARE_DELETE: while held, the folder can be neither renamed, deleted nor replaced by a
+      // junction. The last folder of a target is also the root a rename resolves its name in.
+      const DWORD access = FILE_READ_ATTRIBUTES | SYNCHRONIZE | (last ? FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_TRAVERSE : 0);
+      HANDLE h = CreateFileW(chain[i].c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+      if (h == INVALID_HANDLE_VALUE) {
+        return fail("cannot hold " + rex::path_to_utf8(chain[i]) + " (" + std::to_string(GetLastError()) + ")");
+      }
+      pin->handles_.push_back(h);
+      BY_HANDLE_FILE_INFORMATION info{};
+      if (!InfoOf(h, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+          (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return fail("a link or no folder at " + rex::path_to_utf8(chain[i]));
+      }
+      pin->paths_[key] = h;
+    }
+  }
+  return pin;
+}
+
+void* PinnedChain::Handle(const std::filesystem::path& dir) const {
+  std::wstring key = dir.lexically_normal().wstring();
+  while (key.size() > 3 && (key.back() == L'\\' || key.back() == L'/')) key.pop_back();
+  for (auto& c : key) c = wchar_t(std::towlower(c));
+  auto it = paths_.find(key);
+  return it == paths_.end() ? nullptr : it->second;
+}
+
+PinnedChain::~PinnedChain() {
+  for (void* h : handles_) CloseHandle(static_cast<HANDLE>(h));
+}
+
 
 std::unique_ptr<SlotWriteLock> SlotWriteLock::Acquire(const std::filesystem::path& content_root, const std::string& id,
                                                       std::chrono::milliseconds wait) {
@@ -946,6 +1016,7 @@ X_RESULT HostImportJournal::Import(const SaveImportJournal::Request& rq, const S
   const auto new_file = dir / L"new.xsg";
   enum class Check { kNone, kOpen, kPending, kPath, kBase, kHeader, kRevoked };
   Check failed = Check::kNone;
+  std::string pin_why;
   uint32_t rename_err = 0;
   for (int attempt = 0; attempt < 4; ++attempt) {
     if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -953,7 +1024,13 @@ X_RESULT HostImportJournal::Import(const SaveImportJournal::Request& rq, const S
     rename_err = locked([&](bool open) -> uint32_t {
       if (open) return failed = Check::kOpen, kErrBusy;
       if (StatusOf(pending_dir, "host.pending") != PathState::kMissing) return failed = Check::kPending, kErrBusy;
-      if (!PlainChain(root_, rq.package_file) || !PlainChain(root_, rq.header_file) || !PlainChain(root_, new_file)) {
+      // M6: every folder from the volume root down to the package, the header's folder and this import's
+      // folder held still (no FILE_SHARE_DELETE) and no reparse point, from here through the replace: none
+      // of them can be renamed or swapped for a junction until it is done; the three files are plain (no
+      // reparse point, one name each).
+      const auto pin = PinnedChain::Pin({rq.package_file.parent_path(), rq.header_file.parent_path(), dir}, &pin_why);
+      if (!pin || !PlainFile(rq.package_file) || !PlainFile(rq.header_file) || !PlainFile(new_file)) {
+        if (pin) pin_why = "a link or a second name on a file";
         return failed = Check::kPath, kErrMismatch;
       }
       Sha256 now{};
@@ -988,7 +1065,7 @@ X_RESULT HostImportJournal::Import(const SaveImportJournal::Request& rq, const S
   switch (failed) {
     case Check::kOpen: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "open", report);
     case Check::kPending: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrBusy), "native pending", report);
-    case Check::kPath: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "a link on the path", report);
+    case Check::kPath: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "a link on the path (" + pin_why + ")", report);
     case Check::kBase: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "base differs", report);
     case Check::kHeader: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "header differs", report);
     case Check::kRevoked: return Abort(rq.id, X_RESULT_FROM_WIN32(kErrMismatch), "binding changed", report);
@@ -1150,6 +1227,13 @@ std::unique_ptr<SlotWriteLock> SlotWriteLock::Acquire(const std::filesystem::pat
   return nullptr;
 }
 SlotWriteLock::~SlotWriteLock() = default;
+std::unique_ptr<PinnedChain> PinnedChain::Pin(const std::vector<std::filesystem::path>&, std::string* why) {
+  if (why) *why = "not supported";
+  return nullptr;
+}
+void* PinnedChain::Handle(const std::filesystem::path&) const { return nullptr; }
+PinnedChain::~PinnedChain() = default;
+bool PlainFile(const std::filesystem::path&) { return false; }
 HostImportJournal::HostImportJournal(std::filesystem::path root) : root_(std::move(root)) {}
 std::filesystem::path HostImportJournal::ImportDir(const std::string& id) const {
   return root_ / kBackupDir / "host-import" / id;

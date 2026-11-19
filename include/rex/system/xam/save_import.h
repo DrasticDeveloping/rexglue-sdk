@@ -201,6 +201,28 @@ class SlotWriteLock {
   void* handle_ = nullptr;
 };
 
+// Folders held still (the file-safety re-check M6): every folder from the volume root down to each of
+// `dirs`, opened with FILE_FLAG_OPEN_REPARSE_POINT and without FILE_SHARE_DELETE, so while the chain lives
+// none of them can be renamed, deleted or replaced by a junction; Pin refuses (nullptr, `why`) when any of
+// them is a reparse point or cannot be held. Handle() is the held handle of one of `dirs` (the folder a
+// rename can resolve its name in). Off Windows: nullptr.
+class PinnedChain {
+ public:
+  static std::unique_ptr<PinnedChain> Pin(const std::vector<std::filesystem::path>& dirs, std::string* why);
+  void* Handle(const std::filesystem::path& dir) const;
+  ~PinnedChain();
+  PinnedChain(const PinnedChain&) = delete;
+  PinnedChain& operator=(const PinnedChain&) = delete;
+
+ private:
+  PinnedChain() = default;
+  std::vector<void*> handles_;
+  std::unordered_map<std::wstring, void*> paths_;
+};
+
+// A plain file: it exists, is no reparse point and no folder, and has exactly one name (no hard link).
+bool PlainFile(const std::filesystem::path& path);
+
 // The host import (online_save_to_host): the host's staged save into its own live slot, journaled in its
 // own folders (save-backup\host-import, host-previous-import, host-import-orphaned), never the 1C journal's.
 // Its steps are the 1C journal's (old copies, new copy, prepared record, one replace of the data file,
