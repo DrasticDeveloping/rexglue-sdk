@@ -16,11 +16,13 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -826,6 +828,38 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool pipeline_drop_capture_limit_logged_ = false;
   // The pictures saved in the open window, for its line ("; pictures <names>").
   std::string pipeline_drop_window_pictures_;
+  // The open window's number (1, 2, ... in a run), in its line and in the lines of the pictures
+  // taken in it, which the writer logs later.
+  uint64_t pipeline_drop_window_number_ = 0;
+  // pipeline_drop_capture's writer: one thread resamples, encodes and writes the pictures, so a
+  // slow or blocked disk never holds up a swap (only the readback, which must be that frame's,
+  // stays on the command processor thread). At most kPipelineDropWriterQueue pictures wait; a
+  // capture with the queue full is not taken (before its readback) and is said so. Started with
+  // the first capture; ShutdownContext (or the destructor) lets it write what waits and joins it (a
+  // scripted std::_Exit loses what waits, and its lines with it).
+  struct PipelineDropPictureJob {
+    uint64_t frame = 0;
+    uint64_t window = 0;
+    uint32_t overwriting = 0;
+    uint32_t depth = 0;
+    uint32_t number = 0;
+    uint32_t max = 0;
+    std::string name;
+    std::filesystem::path folder;
+    ui::RawImage image;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+  };
+  static constexpr size_t kPipelineDropWriterQueue = 2;
+  void PipelineDropWriterMain();
+  void StopPipelineDropWriter();
+  std::mutex pipeline_drop_writer_mutex_;
+  std::condition_variable pipeline_drop_writer_cv_;
+  std::deque<PipelineDropPictureJob> pipeline_drop_writer_jobs_;
+  bool pipeline_drop_writer_stop_ = false;
+  std::thread pipeline_drop_writer_;
   PipelineDropCounts pipeline_drops_window_;
   PipelineDropCounts pipeline_drops_total_;
   bool pipeline_drop_this_frame_ = false;

@@ -138,7 +138,11 @@ D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_syste
     : CommandProcessor(graphics_system, kernel_state), deferred_command_list_(*this) {
   legacy_readback_memexport_cvar_name_ = "d3d12_readback_memexport";
 }
-D3D12CommandProcessor::~D3D12CommandProcessor() = default;
+D3D12CommandProcessor::~D3D12CommandProcessor() {
+  // pipeline_drop_capture's writer, if a capture started it and ShutdownContext didn't run: a
+  // joinable std::thread must not reach its destructor.
+  StopPipelineDropWriter();
+}
 
 void D3D12CommandProcessor::UpdateDebugMarkersEnabled() {
   debug_markers_enabled_ = IsGpuDebugMarkersEnabled();
@@ -1745,8 +1749,10 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
-  // The last window's line (if it dropped any) and the session's summary line.
+  // The last window's line (if it dropped any) and the session's summary line; then the picture
+  // writer writes what waits and ends (pipeline_drop_capture).
   LogPipelineDrops(true);
+  StopPipelineDropWriter();
   AwaitAllQueueOperationsCompletion();
   ShutdownSubmitThread();
   InvalidateAllVertexBufferResidency();
@@ -2234,6 +2240,7 @@ void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shade
   bool depth = (used_slots & 1) && normalized_depth_control.z_enable &&
                normalized_depth_control.z_write_enable;
   if (!pipeline_drops_window_.draws) {
+    ++pipeline_drop_window_number_;
     pipeline_drop_window_start_us_ = PipelineDropNowUs();
     pipeline_drop_first_handle_ = pipeline_handle;
     pipeline_drop_first_vs_hash_ = vertex_shader.ucode_data_hash();
@@ -2309,26 +2316,20 @@ void D3D12CommandProcessor::CapturePipelineDropFrame(ui::Presenter& presenter, u
     }
     return;
   }
+  // A full writer queue skips the frame before its readback, so it costs no stall. Only this thread
+  // adds pictures, so the queue can't fill between this test and the push below.
+  {
+    std::lock_guard lock(pipeline_drop_writer_mutex_);
+    if (pipeline_drop_writer_jobs_.size() >= kPipelineDropWriterQueue) {
+      REXGPU_WARN("Pipeline wait: frame {} not saved (the picture writer still has {} waiting)",
+                  frame, pipeline_drop_writer_jobs_.size());
+      return;
+    }
+  }
   ui::RawImage image;
   if (!presenter.CaptureGuestOutput(image) || !image.width || !image.height) {
     REXGPU_WARN("Pipeline wait: frame {} not saved (no guest output picture)", frame);
     return;
-  }
-  // The active part, never past the captured image; the output at the front buffer's size (the
-  // active part's own when that is unknown).
-  const uint32_t src_width = std::min(source_width ? source_width : image.width, image.width);
-  const uint32_t src_height = std::min(source_height ? source_height : image.height, image.height);
-  const uint32_t width = output_width ? output_width : src_width;
-  const uint32_t height = output_height ? output_height : src_height;
-  std::vector<uint8_t> rgb(size_t(width) * height * 3);
-  for (uint32_t y = 0; y < height; ++y) {
-    const uint32_t src_y = uint32_t(uint64_t(y) * src_height / height);
-    const uint8_t* src = image.data.data() + size_t(src_y) * image.stride;
-    uint8_t* dst = rgb.data() + size_t(y) * width * 3;
-    for (uint32_t x = 0; x < width; ++x) {
-      const uint32_t src_x = uint32_t(uint64_t(x) * src_width / width);
-      std::memcpy(dst + size_t(x) * 3, src + size_t(src_x) * 4, 3);  // R8 G8 B8 X8
-    }
   }
   const auto now = std::chrono::system_clock::now();
   const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
@@ -2338,20 +2339,94 @@ void D3D12CommandProcessor::CapturePipelineDropFrame(ui::Presenter& presenter, u
   localtime_s(&local, &seconds);
   const std::string name = fmt::format("pipeline-drop-f{}-{:02}{:02}{:02}-{:03}.png", frame,
                                        local.tm_hour, local.tm_min, local.tm_sec, ms);
-  const std::filesystem::path folder = PipelineDropCaptureFolder();
-  std::error_code ec;
-  std::filesystem::create_directories(folder, ec);
-  if (!WriteStoredRgbPng(folder / name, width, height, rgb)) {
-    REXGPU_WARN("Pipeline wait: frame {} not saved (could not write {})", frame, name);
-    return;
+  // To the writer (PipelineDropWriterMain), which logs the frame's line once the file is written.
+  PipelineDropPictureJob job;
+  job.frame = frame;
+  job.window = pipeline_drops_window_.draws ? pipeline_drop_window_number_ : 0;
+  job.overwriting = overwriting;
+  job.depth = depth;
+  job.number = pipeline_drop_captures_saved_ + 1;
+  job.max = max;
+  job.name = name;
+  job.folder = PipelineDropCaptureFolder();
+  job.image = std::move(image);
+  job.source_width = source_width;
+  job.source_height = source_height;
+  job.output_width = output_width;
+  job.output_height = output_height;
+  {
+    std::lock_guard lock(pipeline_drop_writer_mutex_);
+    pipeline_drop_writer_jobs_.push_back(std::move(job));
+    if (!pipeline_drop_writer_.joinable()) {
+      pipeline_drop_writer_stop_ = false;
+      pipeline_drop_writer_ = std::thread([this] { PipelineDropWriterMain(); });
+    }
   }
+  pipeline_drop_writer_cv_.notify_one();
   ++pipeline_drop_captures_saved_;
-  REXGPU_INFO(
-      "Pipeline wait: frame {} saved as {} ({} overwriting, {} depth-writing draws dropped in it; "
-      "the same swap's guest output, before the host's scaling and presentation; {} of {})",
-      frame, name, overwriting, depth, pipeline_drop_captures_saved_, max);
   if (pipeline_drops_window_.draws) {
     pipeline_drop_window_pictures_ += (pipeline_drop_window_pictures_.empty() ? "" : ", ") + name;
+  }
+}
+
+// pipeline_drop_capture's writer thread: takes the pictures in order; for each, point-samples the
+// guest output's active part (never past the captured image) to the front buffer's size (the
+// active part's own when that is unknown), writes the PNG and logs the frame's line with its
+// window, or why it wasn't saved. Ends when told to and nothing waits.
+void D3D12CommandProcessor::PipelineDropWriterMain() {
+  while (true) {
+    PipelineDropPictureJob job;
+    {
+      std::unique_lock lock(pipeline_drop_writer_mutex_);
+      pipeline_drop_writer_cv_.wait(lock, [this] {
+        return pipeline_drop_writer_stop_ || !pipeline_drop_writer_jobs_.empty();
+      });
+      if (pipeline_drop_writer_jobs_.empty()) {
+        return;
+      }
+      job = std::move(pipeline_drop_writer_jobs_.front());
+      pipeline_drop_writer_jobs_.pop_front();
+    }
+    const ui::RawImage& image = job.image;
+    const uint32_t src_width =
+        std::min(job.source_width ? job.source_width : image.width, image.width);
+    const uint32_t src_height =
+        std::min(job.source_height ? job.source_height : image.height, image.height);
+    const uint32_t width = job.output_width ? job.output_width : src_width;
+    const uint32_t height = job.output_height ? job.output_height : src_height;
+    std::vector<uint8_t> rgb(size_t(width) * height * 3);
+    for (uint32_t y = 0; y < height; ++y) {
+      const uint32_t src_y = uint32_t(uint64_t(y) * src_height / height);
+      const uint8_t* src = image.data.data() + size_t(src_y) * image.stride;
+      uint8_t* dst = rgb.data() + size_t(y) * width * 3;
+      for (uint32_t x = 0; x < width; ++x) {
+        const uint32_t src_x = uint32_t(uint64_t(x) * src_width / width);
+        std::memcpy(dst + size_t(x) * 3, src + size_t(src_x) * 4, 3);  // R8 G8 B8 X8
+      }
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(job.folder, ec);
+    if (!WriteStoredRgbPng(job.folder / job.name, width, height, rgb)) {
+      REXGPU_WARN("Pipeline wait: frame {} not saved (could not write {}; window {})", job.frame,
+                  job.name, job.window);
+      continue;
+    }
+    REXGPU_INFO(
+        "Pipeline wait: frame {} saved as {} ({} overwriting, {} depth-writing draws dropped in "
+        "it; the same swap's guest output, before the host's scaling and presentation; window {}; "
+        "{} of {})",
+        job.frame, job.name, job.overwriting, job.depth, job.window, job.number, job.max);
+  }
+}
+
+void D3D12CommandProcessor::StopPipelineDropWriter() {
+  {
+    std::lock_guard lock(pipeline_drop_writer_mutex_);
+    pipeline_drop_writer_stop_ = true;
+  }
+  pipeline_drop_writer_cv_.notify_one();
+  if (pipeline_drop_writer_.joinable()) {
+    pipeline_drop_writer_.join();
   }
 }
 
@@ -2372,12 +2447,13 @@ void D3D12CommandProcessor::LogPipelineDrops(bool at_exit) {
         "Pipeline wait: {} draws dropped in {} frames over the last {} ms, {} overwriting (colour "
         "written without blending), {} writing depth; waited {:.1f} ms in those frames (at most "
         "{:.1f} ms in one, budget {} ms); first: pipeline {} VS {:016X} PS {:016X} ({}); {} more "
-        "of failed pipelines",
+        "of failed pipelines; window {}",
         w.draws, w.frames, (PipelineDropNowUs() - pipeline_drop_window_start_us_) / 1000,
         w.overwriting, w.depth, pipeline_drop_window_wait_us_ / 1000.0,
         pipeline_drop_window_wait_max_us_ / 1000.0, REXCVAR_GET(pipeline_wait_budget_ms),
         pipeline_drop_first_handle_, pipeline_drop_first_vs_hash_, pipeline_drop_first_ps_hash_,
-        pipeline_drop_first_overwriting_ ? "overwriting" : "blended or no colour", w.failed);
+        pipeline_drop_first_overwriting_ ? "overwriting" : "blended or no colour", w.failed,
+        pipeline_drop_window_number_);
     if (!pipeline_drop_window_pictures_.empty()) {
       // pipeline_drop_capture: the window's saved pictures, on a line of their own right after.
       REXGPU_INFO("Pipeline wait: that window's pictures: {}", pipeline_drop_window_pictures_);
