@@ -819,8 +819,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // what came of them: `draws`, waited and drawn (the fix's rescues); `timed_out`, waited until a
   // limit ended the wait with the pipeline still being created (dropped); `failed`, their
   // pipeline's creation had failed (dropped; each such pipeline also gets one line of its own, so
-  // the loss is always in the log). A line at most once a second while any waited or timed out, and a summary
-  // at exit, so what the waits cost and what they missed are numbers.
+  // the loss is always in the log). A line at most once a second while any waited or timed out,
+  // and a summary at exit, so what the waits cost and what they missed are numbers.
   struct PipelineHoleWaitCounts {
     uint64_t draws = 0;
     uint64_t timed_out = 0;
@@ -848,11 +848,22 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool pipeline_hole_wait_this_frame_ = false;
   int64_t pipeline_hole_wait_frame_us_ = 0;
   int64_t pipeline_hole_wait_window_start_us_ = 0;
-  // Set when a hole-making draw waited the whole safety limit (kPipelineHoleWaitLimitUs) and its
-  // pipeline was still being created: from then on such draws keep the budget, as before the fix,
-  // so a creation that never ends can't stop the game for good.
-  bool pipeline_hole_wait_gave_up_ = false;
-  static constexpr int64_t kPipelineHoleWaitLimitUs = 10 * 1000 * 1000;
+  // The safety limits of pipeline_wait_hole_draws, so a creation that never ends can't stop the
+  // game for good. A frame's hole waits together never go past kPipelineHoleWaitFrameLimitUs: once
+  // they reach it, that frame's other hole-making draws keep the budget (one warning a frame). A
+  // pipeline whose own waits (timed out, summed over frames) reach kPipelineHoleWaitPipelineLimitUs
+  // is given up for the run (one warning naming it): its draws keep the budget, every other
+  // pipeline keeps the protection. 10 s each: the measured waits are milliseconds (a test run's
+  // worst frame waited 26.6 ms under the old budget), so only a hung creation reaches them.
+  static constexpr int64_t kPipelineHoleWaitFrameLimitUs = 10 * 1000 * 1000;
+  static constexpr int64_t kPipelineHoleWaitPipelineLimitUs = 10 * 1000 * 1000;
+  std::unordered_map<void*, int64_t> pipeline_hole_wait_pipeline_us_;
+  std::unordered_set<void*> pipeline_hole_wait_given_up_;
+  bool pipeline_hole_wait_frame_limit_logged_ = false;
+  // Waits for a pending pipeline at most `limit_us`, in slices of a few milliseconds so a shutdown
+  // (worker_running_ off) or a removed device ends the wait at once (`stopped`). The pipeline, or
+  // nullptr when it failed, the limit came or the wait was stopped.
+  ID3D12PipelineState* WaitForHolePipeline(void* pipeline_handle, int64_t limit_us, bool& stopped);
   // At a frame's end (IssueSwap, before the wait budget is reset). check_deadline false: the
   // window's line waits (LogPipelineDropsIfDue later in the same swap) for this frame's saved
   // picture.

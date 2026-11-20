@@ -101,10 +101,13 @@ REXCVAR_DEFINE_INT32(pipeline_wait_budget_ms, 4, "GPU",
 // frame). Safe: the console never drops a draw; the wait is the synchronous path's, on the command
 // processor thread, outside every lock the creation threads take (they take only the queue's and
 // the translation's own); the cost is a hitch the first time a hole-making pipeline is needed, none
-// once it exists or with a warm pipeline cache. A creation still running after
-// kPipelineHoleWaitLimitUs (10 s) makes the fix give up for the run with a warning (the budget
-// again), so a creation that never ends can't hang the game. With async_shader_compilation off it
-// changes nothing (no draw waits for a pending pipeline or is dropped there).
+// once it exists or with a warm pipeline cache. Safety limits, so a creation that never ends can't
+// hang the game: one frame's waits together stop at kPipelineHoleWaitFrameLimitUs (10 s; that
+// frame's other hole-making draws keep the budget), a pipeline whose own waits reach
+// kPipelineHoleWaitPipelineLimitUs (10 s) is given up for the run with a warning naming it (only
+// its draws keep the budget), and a shutdown or a removed device ends a wait at once. With
+// async_shader_compilation off it changes nothing (no draw waits for a pending pipeline or is
+// dropped there). Off, the not-ready path is the old one (no classification before the wait).
 REXCVAR_DEFINE_BOOL(pipeline_wait_hole_draws, true, "GPU",
                     "With async shader compilation: a draw that writes colour without blending, "
                     "depth or stencil waits for its pipeline however long its creation takes, "
@@ -2362,6 +2365,29 @@ D3D12CommandProcessor::PipelineDropHole D3D12CommandProcessor::ClassifyPipelineD
   return hole;
 }
 
+ID3D12PipelineState* D3D12CommandProcessor::WaitForHolePipeline(void* pipeline_handle,
+                                                                int64_t limit_us, bool& stopped) {
+  stopped = false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::microseconds(std::max(int64_t(0), limit_us));
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  while (true) {
+    const auto slice_end =
+        std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(5));
+    ID3D12PipelineState* state = pipeline_cache_->WaitForPipeline(pipeline_handle, slice_end);
+    if (state || pipeline_cache_->IsPipelineCreationFailed(pipeline_handle)) {
+      return state;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return nullptr;
+    }
+    if (!worker_running_ || device->GetDeviceRemovedReason() != S_OK) {
+      stopped = true;
+      return nullptr;
+    }
+  }
+}
+
 // pipeline_wait_hole_draws: one hole-making draw whose pipeline wasn't ready, and what came of it.
 // A failed creation opens no window of its own (a failed pipeline's draws come every frame); it
 // goes into an open window and the total, and its pipeline gets one line the first time.
@@ -2416,7 +2442,9 @@ void D3D12CommandProcessor::FinishPipelineHoleWaitFrame() {
       ++counts->frames;
       counts->frame_max_us = std::max(counts->frame_max_us, pipeline_hole_wait_frame_us_);
     }
+    // A new frame gets the whole kPipelineHoleWaitFrameLimitUs again.
     pipeline_hole_wait_frame_us_ = 0;
+    pipeline_hole_wait_frame_limit_logged_ = false;
   }
   if (PipelineDropNowUs() - pipeline_hole_wait_window_start_us_ >= 1000000) {
     LogPipelineHoleWaits(false);
@@ -3325,38 +3353,63 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     if (REXCVAR_GET(pipeline_wait_hole_draws)) {
       hole = ClassifyPipelineDropHole(normalized_color_mask, normalized_depth_control);
       hole_classified = true;
-      wait_whole =
-          !pipeline_hole_wait_gave_up_ && (hole.overwriting || hole.depth || hole.stencil);
+      if (hole.overwriting || hole.depth || hole.stencil) {
+        if (pipeline_hole_wait_given_up_.count(pipeline_handle)) {
+          // Given up for this pipeline (its warning came then): the budget, as before the fix.
+        } else if (pipeline_hole_wait_frame_us_ >= kPipelineHoleWaitFrameLimitUs) {
+          if (!pipeline_hole_wait_frame_limit_logged_) {
+            pipeline_hole_wait_frame_limit_logged_ = true;
+            REXGPU_WARN(
+                "Pipeline wait: this frame's waits for pipelines reached {} s; its other draws "
+                "that would leave a hole keep the budget",
+                kPipelineHoleWaitFrameLimitUs / 1000000);
+          }
+        } else {
+          wait_whole = true;
+        }
+      }
     }
-    if (wait_whole || pipeline_wait_used_us_ < budget_us) {
+    if (wait_whole) {
+      // As long as the creation takes, within what is left of the frame's limit.
+      bool stopped = false;
       const auto wait_start = std::chrono::steady_clock::now();
-      waited = pipeline_cache_->WaitForPipeline(
-          pipeline_handle,
-          wait_start + std::chrono::microseconds(wait_whole
-                                                     ? kPipelineHoleWaitLimitUs
-                                                     : budget_us - pipeline_wait_used_us_));
+      waited = WaitForHolePipeline(pipeline_handle,
+                                   kPipelineHoleWaitFrameLimitUs - pipeline_hole_wait_frame_us_,
+                                   stopped);
       const int64_t waited_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - wait_start)
                                     .count();
       // The wait counts against the frame's budget too, so the blended draws after it in the same
       // frame don't add their own waits to the hitch.
       pipeline_wait_used_us_ += waited_us;
-      if (wait_whole) {
-        const bool failed = !waited && pipeline_cache_->IsPipelineCreationFailed(pipeline_handle);
-        CountPipelineHoleWait(waited_us, hole,
-                              waited   ? PipelineHoleWaitOutcome::kDrawn
-                              : failed ? PipelineHoleWaitOutcome::kFailed
-                                       : PipelineHoleWaitOutcome::kTimedOut,
-                              pipeline_handle, *vertex_shader, pixel_shader);
-        if (!waited && !failed) {
-          pipeline_hole_wait_gave_up_ = true;
+      const bool failed = !waited && pipeline_cache_->IsPipelineCreationFailed(pipeline_handle);
+      CountPipelineHoleWait(waited_us, hole,
+                            waited   ? PipelineHoleWaitOutcome::kDrawn
+                            : failed ? PipelineHoleWaitOutcome::kFailed
+                                     : PipelineHoleWaitOutcome::kTimedOut,
+                            pipeline_handle, *vertex_shader, pixel_shader);
+      if (!waited && !failed && !stopped) {
+        // Timed out: this pipeline's own waits, summed; at the limit it is given up for the run.
+        int64_t& pipeline_us = pipeline_hole_wait_pipeline_us_[pipeline_handle];
+        pipeline_us += waited_us;
+        if (pipeline_us >= kPipelineHoleWaitPipelineLimitUs &&
+            pipeline_hole_wait_given_up_.insert(pipeline_handle).second) {
           REXGPU_WARN(
-              "Pipeline wait: a draw that would leave a hole waited {} s for its pipeline, still "
-              "being created; pipeline_wait_hole_draws gives up for this run (such draws keep the "
-              "budget again)",
-              kPipelineHoleWaitLimitUs / 1000000);
+              "Pipeline wait: pipeline {} VS {:016X} PS {:016X} still being created after {:.1f} s "
+              "of waits; its draws that would leave a hole keep the budget from now on (the other "
+              "pipelines keep waiting)",
+              pipeline_handle, vertex_shader->ucode_data_hash(),
+              pixel_shader ? pixel_shader->ucode_data_hash() : 0, pipeline_us / 1000000.0);
         }
       }
+    } else if (pipeline_wait_used_us_ < budget_us) {
+      const auto wait_start = std::chrono::steady_clock::now();
+      waited = pipeline_cache_->WaitForPipeline(
+          pipeline_handle,
+          wait_start + std::chrono::microseconds(budget_us - pipeline_wait_used_us_));
+      pipeline_wait_used_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - wait_start)
+                                    .count();
     }
     if (!waited) {
       // Dropped: counted and logged (CountPipelineDrop). The render target cache's Update above
