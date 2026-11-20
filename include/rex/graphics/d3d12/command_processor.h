@@ -817,13 +817,16 @@ class D3D12CommandProcessor : public CommandProcessor {
                          bool creation_failed);
   // pipeline_wait_hole_draws: the hole-making draws whose pipeline wasn't ready, counted apart by
   // what came of them: `draws`, waited and drawn (the fix's rescues); `timed_out`, waited until a
-  // limit ended the wait with the pipeline still being created (dropped); `failed`, their
-  // pipeline's creation had failed (dropped; each such pipeline also gets one line of its own, so
-  // the loss is always in the log). A line at most once a second while any waited or timed out,
-  // and a summary at exit, so what the waits cost and what they missed are numbers.
+  // limit ended the wait with the pipeline still being created (dropped); `cancelled`, a shutdown
+  // or a removed device ended or prevented the wait (dropped); `failed`, their pipeline's creation
+  // had failed (dropped; the drop site names each such pipeline once, so the loss is always in the
+  // log). Every outcome's time counts against the frame's limit and in the worst frame. A line at
+  // most once a second while any waited, timed out or was cancelled, and a summary at exit, so what
+  // the waits cost and what they missed are numbers.
   struct PipelineHoleWaitCounts {
     uint64_t draws = 0;
     uint64_t timed_out = 0;
+    uint64_t cancelled = 0;
     uint64_t failed = 0;
     uint64_t frames = 0;
     // Of the draws that waited and drew.
@@ -833,11 +836,16 @@ class D3D12CommandProcessor : public CommandProcessor {
     int64_t wait_us = 0;
     int64_t frame_max_us = 0;
   };
-  enum class PipelineHoleWaitOutcome { kDrawn, kTimedOut, kFailed };
+  enum class PipelineHoleWaitOutcome { kDrawn, kTimedOut, kCancelled, kFailed };
   void CountPipelineHoleWait(int64_t wait_us, const PipelineDropHole& hole,
-                             PipelineHoleWaitOutcome outcome, void* pipeline_handle,
-                             const Shader& vertex_shader, const Shader* pixel_shader);
-  // The pipelines whose failed creation has had its line (CountPipelineHoleWait, kFailed).
+                             PipelineHoleWaitOutcome outcome);
+  // Whether the hole-wait window has something to log (a draw that waited, timed out or was
+  // cancelled; failed ones only join a window that is open).
+  bool PipelineHoleWaitWindowPending() const {
+    return pipeline_hole_waits_window_.draws || pipeline_hole_waits_window_.timed_out ||
+           pipeline_hole_waits_window_.cancelled;
+  }
+  // The pipelines whose failed creation has had its line (IssueDraw's drop site).
   std::unordered_set<void*> pipeline_hole_failed_logged_;
   // At a frame's end (IssueSwap): the frame's waits into the window, and the window's line once
   // due.
@@ -860,10 +868,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unordered_map<void*, int64_t> pipeline_hole_wait_pipeline_us_;
   std::unordered_set<void*> pipeline_hole_wait_given_up_;
   bool pipeline_hole_wait_frame_limit_logged_ = false;
-  // Waits for a pending pipeline at most `limit_us`, in slices of a few milliseconds so a shutdown
-  // (worker_running_ off) or a removed device ends the wait at once (`stopped`). The pipeline, or
-  // nullptr when it failed, the limit came or the wait was stopped.
-  ID3D12PipelineState* WaitForHolePipeline(void* pipeline_handle, int64_t limit_us, bool& stopped);
+  // Waits for a pending pipeline at most `limit_us`. A shutdown (worker_running_ off) or a removed
+  // device is checked before the wait starts and every millisecond while it runs, and ends it at
+  // once (`cancelled`). The pipeline, or nullptr when it failed, the limit came or the wait was
+  // cancelled.
+  ID3D12PipelineState* WaitForHolePipeline(void* pipeline_handle, int64_t limit_us,
+                                           bool& cancelled);
   // At a frame's end (IssueSwap, before the wait budget is reset). check_deadline false: the
   // window's line waits (LogPipelineDropsIfDue later in the same swap) for this frame's saved
   // picture.
