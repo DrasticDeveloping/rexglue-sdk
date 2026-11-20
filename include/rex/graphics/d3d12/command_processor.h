@@ -860,6 +860,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::deque<PipelineDropPictureJob> pipeline_drop_writer_jobs_;
   bool pipeline_drop_writer_stop_ = false;
   std::thread pipeline_drop_writer_;
+  // Latched at the first failed picture (a readback that failed, or a file that couldn't be
+  // written: a folder that isn't writable stays so): one warning, then no more captures this run,
+  // so later frames don't repeat the readback, the encoding and the disk write. Set by the writer
+  // thread too, read on the drop path.
+  std::atomic<bool> pipeline_drop_capture_failed_{false};
   PipelineDropCounts pipeline_drops_window_;
   PipelineDropCounts pipeline_drops_total_;
   bool pipeline_drop_this_frame_ = false;

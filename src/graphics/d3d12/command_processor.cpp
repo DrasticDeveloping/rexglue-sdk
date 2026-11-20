@@ -2259,7 +2259,8 @@ void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shade
   // pipeline_drop_capture: a hole this frame (an overwriting or depth-writing draw dropped), so
   // its picture is wanted at the swap. Only here on the drop path, so the setting off costs
   // IssueSwap one flag test.
-  if ((overwriting || depth) && REXCVAR_GET(pipeline_drop_capture)) {
+  if ((overwriting || depth) && REXCVAR_GET(pipeline_drop_capture) &&
+      !pipeline_drop_capture_failed_.load(std::memory_order_relaxed)) {
     pipeline_drop_capture_wanted_ = true;
     pipeline_drop_frame_overwriting_ += overwriting;
     pipeline_drop_frame_depth_ += depth;
@@ -2326,9 +2327,15 @@ void D3D12CommandProcessor::CapturePipelineDropFrame(ui::Presenter& presenter, u
       return;
     }
   }
+  if (pipeline_drop_capture_failed_.load(std::memory_order_relaxed)) {
+    return;
+  }
   ui::RawImage image;
   if (!presenter.CaptureGuestOutput(image) || !image.width || !image.height) {
-    REXGPU_WARN("Pipeline wait: frame {} not saved (no guest output picture)", frame);
+    pipeline_drop_capture_failed_.store(true, std::memory_order_relaxed);
+    REXGPU_WARN(
+        "Pipeline wait: frame {} not saved (no guest output picture); no more pictures this run",
+        frame);
     return;
   }
   const auto now = std::chrono::system_clock::now();
@@ -2407,8 +2414,14 @@ void D3D12CommandProcessor::PipelineDropWriterMain() {
     std::error_code ec;
     std::filesystem::create_directories(job.folder, ec);
     if (!WriteStoredRgbPng(job.folder / job.name, width, height, rgb)) {
-      REXGPU_WARN("Pipeline wait: frame {} not saved (could not write {}; window {})", job.frame,
-                  job.name, job.window);
+      // The first failure latches (pipeline_drop_capture_failed_); a picture already waiting is
+      // still tried, silently.
+      if (!pipeline_drop_capture_failed_.exchange(true, std::memory_order_relaxed)) {
+        REXGPU_WARN(
+            "Pipeline wait: frame {} not saved (could not write {}; window {}); no more pictures "
+            "this run",
+            job.frame, (job.folder / job.name).string(), job.window);
+      }
       continue;
     }
     REXGPU_INFO(
