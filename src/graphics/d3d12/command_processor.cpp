@@ -2143,17 +2143,17 @@ bool WriteStoredRgbPng(const std::filesystem::path& path, uint32_t width, uint32
   return !ec;
 }
 
-// pipeline_drop_capture's folder: the log's (log_file), else the working folder's logs, where the
-// logging puts a log without a name.
+// pipeline_drop_capture's folder: the one the active log file is in, as the logging opened it
+// (ActiveLogFilePath: absolute, from log_file or the sequential name in log_dir), so a picture is
+// beside the log whichever way it was named; without a file sink, the working folder.
 std::filesystem::path PipelineDropCaptureFolder() {
-  const std::string log_file = REXCVAR_GET(log_file);
-  if (!log_file.empty()) {
-    std::filesystem::path folder = std::filesystem::u8path(log_file).parent_path();
-    if (!folder.empty()) {
-      return folder;
-    }
+  const std::filesystem::path log_path = rex::ActiveLogFilePath();
+  if (!log_path.empty() && log_path.has_parent_path()) {
+    return log_path.parent_path();
   }
-  return std::filesystem::current_path() / "logs";
+  std::error_code ec;
+  std::filesystem::path folder = std::filesystem::current_path(ec);
+  return ec ? std::filesystem::path(".") : folder;
 }
 }  // namespace
 
