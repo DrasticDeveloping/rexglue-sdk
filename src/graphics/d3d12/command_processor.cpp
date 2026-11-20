@@ -2206,9 +2206,9 @@ std::filesystem::path PipelineDropCaptureFolder() {
 // A draw IssueDraw dropped because its pipeline wasn't created within the frame's wait budget
 // (async_shader_compilation, pipeline_wait_budget_ms). Only counts; the draw stays dropped as
 // before. "Overwriting" (ClassifyPipelineDropHole): a written channel group of a target whose
-// result doesn't depend on the destination (Xenos has no blend enable bit; dest factor ZERO with ADD
-// or a subtraction is blending off), the kind of draw whose absence leaves the target's old pixels
-// instead of a missing object.
+// result doesn't depend on the destination (Xenos has no blend enable bit; dest factor ZERO with
+// ADD or a subtraction is blending off), the kind of draw whose absence leaves the target's old
+// pixels instead of a missing object.
 void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
                                               const Shader* pixel_shader,
                                               const PipelineDropHole& hole,
@@ -3285,14 +3285,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // -> 7 per run with 4 ms, the rest in loading screens).
     ID3D12PipelineState* waited = nullptr;
     const int64_t budget_us = int64_t(REXCVAR_GET(pipeline_wait_budget_ms)) * 1000;
-    // pipeline_wait_hole_draws: a draw that would leave a hole (colour written without blending,
-    // depth or stencil) waits for its pipeline however long its creation takes, as the synchronous
-    // path does; only the safety limit ends it. Classified only here, for a pipeline not ready.
-    const PipelineDropHole hole =
-        ClassifyPipelineDropHole(normalized_color_mask, normalized_depth_control);
-    const bool wait_whole = REXCVAR_GET(pipeline_wait_hole_draws) &&
-                            !pipeline_hole_wait_gave_up_ &&
-                            (hole.overwriting || hole.depth || hole.stencil);
+    // pipeline_wait_hole_draws: a draw that would leave a hole (a written channel group replacing
+    // its destination, depth or stencil that can change) waits for its pipeline however long its
+    // creation takes, as the synchronous path does; only the safety limit ends it. Classified only
+    // with the setting on: off, the path below is the old one (the budget's wait, and the counter
+    // classifies a draw only once it is dropped).
+    PipelineDropHole hole;
+    bool hole_classified = false;
+    bool wait_whole = false;
+    if (REXCVAR_GET(pipeline_wait_hole_draws)) {
+      hole = ClassifyPipelineDropHole(normalized_color_mask, normalized_depth_control);
+      hole_classified = true;
+      wait_whole =
+          !pipeline_hole_wait_gave_up_ && (hole.overwriting || hole.depth || hole.stencil);
+    }
     if (wait_whole || pipeline_wait_used_us_ < budget_us) {
       const auto wait_start = std::chrono::steady_clock::now();
       waited = pipeline_cache_->WaitForPipeline(
@@ -3324,6 +3330,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // written keep the targets' old contents for this frame. A pipeline whose creation failed
       // (WaitForPipeline returns nullptr for it with time left too) is told apart from one still
       // being created and counted on its own; the drop and the wait accounting are the same.
+      if (!hole_classified) {
+        hole = ClassifyPipelineDropHole(normalized_color_mask, normalized_depth_control);
+      }
       CountPipelineDrop(pipeline_handle, *vertex_shader, pixel_shader, hole,
                         pipeline_cache_->IsPipelineCreationFailed(pipeline_handle));
       return true;
