@@ -2397,14 +2397,21 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   InvalidateAllVertexBufferResidency();
   // pipeline_drop_capture: this frame dropped an overwriting or depth-writing draw (the flag is
   // only set with the setting on), so its picture is saved after the refresh below; the frame's
-  // counts are taken here so a swap that returns early doesn't carry them into the next frame.
-  const bool capture_frame = pipeline_drop_capture_wanted_;
-  const uint64_t capture_frame_number = frame_current_;
-  const uint32_t capture_overwriting = pipeline_drop_frame_overwriting_;
-  const uint32_t capture_depth = pipeline_drop_frame_depth_;
-  pipeline_drop_capture_wanted_ = false;
-  pipeline_drop_frame_overwriting_ = 0;
-  pipeline_drop_frame_depth_ = 0;
+  // counts are taken and cleared here, before any early return, so a swap that returns early
+  // doesn't carry them into the next frame. Without the flag nothing but the flag is read.
+  bool capture_frame = false;
+  uint64_t capture_frame_number = 0;
+  uint32_t capture_overwriting = 0;
+  uint32_t capture_depth = 0;
+  if (pipeline_drop_capture_wanted_) {
+    capture_frame = true;
+    capture_frame_number = frame_current_;
+    capture_overwriting = pipeline_drop_frame_overwriting_;
+    capture_depth = pipeline_drop_frame_depth_;
+    pipeline_drop_capture_wanted_ = false;
+    pipeline_drop_frame_overwriting_ = 0;
+    pipeline_drop_frame_depth_ = 0;
+  }
   // The frame's dropped draws (CountPipelineDrop), while its wait budget use is still known.
   FinishPipelineDropFrame(!capture_frame);
   // A new frame gets the whole pipeline_wait_budget_ms again.
