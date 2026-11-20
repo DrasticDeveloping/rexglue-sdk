@@ -16,11 +16,13 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -796,12 +798,112 @@ class D3D12CommandProcessor : public CommandProcessor {
     // logged the failure once; a failed pipeline's draws come every frame).
     uint64_t failed = 0;
   };
+  // What a draw whose pipeline isn't ready would leave behind if dropped, from the targets the
+  // render target cache really gave it (host render target path; the interlock path reads the
+  // register state): `overwriting`, colour written without blending to a target; `depth`, depth
+  // written; `stencil`, stencil written. Any of them: a hole (the targets' old contents) for that
+  // frame. None: a blended draw or one writing nothing, an object missing for a frame.
+  struct PipelineDropHole {
+    bool overwriting = false;
+    bool depth = false;
+    bool stencil = false;
+  };
+  PipelineDropHole ClassifyPipelineDropHole(uint32_t normalized_color_mask,
+                                            reg::RB_DEPTHCONTROL normalized_depth_control) const;
   void CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
-                         const Shader* pixel_shader, uint32_t normalized_color_mask,
-                         reg::RB_DEPTHCONTROL normalized_depth_control, bool creation_failed);
-  // At a frame's end (IssueSwap, before the wait budget is reset).
-  void FinishPipelineDropFrame();
+                         const Shader* pixel_shader, const PipelineDropHole& hole,
+                         bool creation_failed);
+  // pipeline_wait_hole_draws: the draws that waited for their pipeline because dropping them would
+  // leave a hole, counted like the drops: a line at most once a second while any waited, and a
+  // summary at exit, so what the waits cost is a number.
+  struct PipelineHoleWaitCounts {
+    uint64_t draws = 0;
+    uint64_t frames = 0;
+    uint64_t overwriting = 0;
+    uint64_t depth_or_stencil = 0;
+    int64_t wait_us = 0;
+    // The most one frame waited in all.
+    int64_t frame_max_us = 0;
+  };
+  void CountPipelineHoleWait(int64_t wait_us, const PipelineDropHole& hole);
+  // At a frame's end (IssueSwap): the frame's waits into the window, and the window's line once
+  // due.
+  void FinishPipelineHoleWaitFrame();
+  void LogPipelineHoleWaits(bool at_exit);
+  PipelineHoleWaitCounts pipeline_hole_waits_window_;
+  PipelineHoleWaitCounts pipeline_hole_waits_total_;
+  bool pipeline_hole_wait_this_frame_ = false;
+  int64_t pipeline_hole_wait_frame_us_ = 0;
+  int64_t pipeline_hole_wait_window_start_us_ = 0;
+  // Set when a hole-making draw waited the whole safety limit (kPipelineHoleWaitLimitUs) and its
+  // pipeline was still being created: from then on such draws keep the budget, as before the fix,
+  // so a creation that never ends can't stop the game for good.
+  bool pipeline_hole_wait_gave_up_ = false;
+  static constexpr int64_t kPipelineHoleWaitLimitUs = 10 * 1000 * 1000;
+  // At a frame's end (IssueSwap, before the wait budget is reset). check_deadline false: the
+  // window's line waits (LogPipelineDropsIfDue later in the same swap) for this frame's saved
+  // picture.
+  void FinishPipelineDropFrame(bool check_deadline);
+  // Logs the open window's line once its first drop is a second old.
+  void LogPipelineDropsIfDue();
   void LogPipelineDrops(bool at_exit);
+  // pipeline_drop_capture (a debug setting, off by default): the same swap's guest output (the
+  // image IssueSwap has just refreshed, before the host's scaling and presentation, not necessarily
+  // what reached the screen) saved next to the log when the frame dropped a draw that
+  // overwrites colour or writes depth, at most pipeline_drop_capture_max a run. `overwriting` and
+  // `depth`: that frame's counts, for its line.
+  // `source_width` x `source_height`: the active part of the guest output (the swap's
+  // guest_output_width/height); `output_width` x `output_height`: the active guest front buffer's
+  // own size, the picture's.
+  void CapturePipelineDropFrame(ui::Presenter& presenter, uint64_t frame, uint32_t overwriting,
+                                uint32_t depth, uint32_t source_width, uint32_t source_height,
+                                uint32_t output_width, uint32_t output_height);
+  // Set on the drop path only (CountPipelineDrop, with the setting on): this frame dropped an
+  // overwriting or depth-writing draw, and how many of each; IssueSwap tests the flag once a frame.
+  bool pipeline_drop_capture_wanted_ = false;
+  uint32_t pipeline_drop_frame_overwriting_ = 0;
+  uint32_t pipeline_drop_frame_depth_ = 0;
+  uint32_t pipeline_drop_captures_saved_ = 0;
+  bool pipeline_drop_capture_limit_logged_ = false;
+  // The pictures taken in the open window, named at the end of its own line ("; pictures <names>").
+  std::string pipeline_drop_window_pictures_;
+  // The open window's number (1, 2, ... in a run), in its line and in the lines of the pictures
+  // taken in it, which the writer logs later.
+  uint64_t pipeline_drop_window_number_ = 0;
+  // pipeline_drop_capture's writer: one thread resamples, encodes and writes the pictures, so a
+  // slow or blocked disk never holds up a swap (only the readback, which must be that frame's,
+  // stays on the command processor thread). At most kPipelineDropWriterQueue pictures wait; a
+  // capture with the queue full is not taken (before its readback) and is said so. Started with
+  // the first capture; ShutdownContext (or the destructor) lets it write what waits and joins it (a
+  // scripted std::_Exit loses what waits, and its lines with it).
+  struct PipelineDropPictureJob {
+    uint64_t frame = 0;
+    uint64_t window = 0;
+    uint32_t overwriting = 0;
+    uint32_t depth = 0;
+    uint32_t number = 0;
+    uint32_t max = 0;
+    std::string name;
+    std::filesystem::path folder;
+    ui::RawImage image;
+    uint32_t source_width = 0;
+    uint32_t source_height = 0;
+    uint32_t output_width = 0;
+    uint32_t output_height = 0;
+  };
+  static constexpr size_t kPipelineDropWriterQueue = 2;
+  void PipelineDropWriterMain();
+  void StopPipelineDropWriter();
+  std::mutex pipeline_drop_writer_mutex_;
+  std::condition_variable pipeline_drop_writer_cv_;
+  std::deque<PipelineDropPictureJob> pipeline_drop_writer_jobs_;
+  bool pipeline_drop_writer_stop_ = false;
+  std::thread pipeline_drop_writer_;
+  // Latched at the first failed picture (a readback that failed, or a file that couldn't be
+  // written: a folder that isn't writable stays so): one warning, then no more captures this run,
+  // so later frames don't repeat the readback, the encoding and the disk write. Set by the writer
+  // thread too, read on the drop path.
+  std::atomic<bool> pipeline_drop_capture_failed_{false};
   PipelineDropCounts pipeline_drops_window_;
   PipelineDropCounts pipeline_drops_total_;
   bool pipeline_drop_this_frame_ = false;
