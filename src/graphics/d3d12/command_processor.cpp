@@ -2335,34 +2335,40 @@ D3D12CommandProcessor::PipelineDropHole D3D12CommandProcessor::ClassifyPipelineD
   hole.depth = (used_slots & 1) && normalized_depth_control.z_enable &&
                normalized_depth_control.z_write_enable;
   if ((used_slots & 1) && normalized_depth_control.stencil_enable) {
-    // Stencil that can change: a face with a non-zero write mask and an operation other than KEEP
-    // on an outcome that can happen (the stencil test failing unless it always passes, the depth
-    // test failing only when it is on and can fail, passing unless the stencil test never passes).
-    // The back faces count when they have their own state; otherwise they use the front's.
+    // Stencil that can change, judged on the side of waiting. An operation other than KEEP counts on
+    // an outcome that can happen: the stencil test failing (unless it always passes), the depth test
+    // failing (depth on and not ALWAYS, the stencil test not NEVER), both passing (the stencil test
+    // not NEVER and the depth test able to pass: depth off or not NEVER). The pipeline
+    // (PipelineCache::GetCurrentStateDescription) has one write mask for both faces, the back
+    // faces' only when front faces are culled, and the back faces' operations only for polygonal
+    // primitives with backface_enable; here a write mask counts if either face's is non-zero, the
+    // back faces' operations count whenever backface_enable is set, and culling isn't looked at. That
+    // can add a wait the pipeline wouldn't need, never miss a write it can make.
     const bool z_can_fail = normalized_depth_control.z_enable &&
                             normalized_depth_control.zfunc != xenos::CompareFunction::kAlways;
-    auto face_changes = [z_can_fail](uint32_t write_mask, xenos::CompareFunction func,
-                                     xenos::StencilOp fail, xenos::StencilOp zfail,
-                                     xenos::StencilOp zpass) {
-      if (!write_mask) {
-        return false;
-      }
+    const bool z_can_pass = !normalized_depth_control.z_enable ||
+                            normalized_depth_control.zfunc != xenos::CompareFunction::kNever;
+    auto ops_change = [z_can_fail, z_can_pass](xenos::CompareFunction func, xenos::StencilOp fail,
+                                               xenos::StencilOp zfail, xenos::StencilOp zpass) {
       const bool fail_reachable = func != xenos::CompareFunction::kAlways;
       const bool pass_reachable = func != xenos::CompareFunction::kNever;
       return (fail_reachable && fail != xenos::StencilOp::kKeep) ||
              (pass_reachable && z_can_fail && zfail != xenos::StencilOp::kKeep) ||
-             (pass_reachable && zpass != xenos::StencilOp::kKeep);
+             (pass_reachable && z_can_pass && zpass != xenos::StencilOp::kKeep);
     };
-    hole.stencil = face_changes(regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask,
-                                normalized_depth_control.stencilfunc,
+    const bool masked =
+        regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0 ||
+        regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilwritemask != 0;
+    if (masked) {
+      hole.stencil = ops_change(normalized_depth_control.stencilfunc,
                                 normalized_depth_control.stencilfail,
                                 normalized_depth_control.stencilzfail,
-                                normalized_depth_control.stencilzpass);
-    if (!hole.stencil && normalized_depth_control.backface_enable) {
-      hole.stencil = face_changes(
-          regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilwritemask,
-          normalized_depth_control.stencilfunc_bf, normalized_depth_control.stencilfail_bf,
-          normalized_depth_control.stencilzfail_bf, normalized_depth_control.stencilzpass_bf);
+                                normalized_depth_control.stencilzpass) ||
+                     (normalized_depth_control.backface_enable &&
+                      ops_change(normalized_depth_control.stencilfunc_bf,
+                                 normalized_depth_control.stencilfail_bf,
+                                 normalized_depth_control.stencilzfail_bf,
+                                 normalized_depth_control.stencilzpass_bf));
     }
   }
   return hole;
