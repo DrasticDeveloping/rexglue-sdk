@@ -2083,13 +2083,21 @@ void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shade
 }
 
 void D3D12CommandProcessor::FinishPipelineDropFrame() {
-  if (!pipeline_drop_this_frame_) {
+  // No window pending: one test on a frame end.
+  if (!pipeline_drops_window_.draws) {
     return;
   }
-  pipeline_drop_this_frame_ = false;
-  pipeline_drop_window_wait_us_ += pipeline_wait_used_us_;
-  pipeline_drop_window_wait_max_us_ =
-      std::max(pipeline_drop_window_wait_max_us_, pipeline_wait_used_us_);
+  // The wait budget counts only for the frames that dropped draws.
+  if (pipeline_drop_this_frame_) {
+    pipeline_drop_this_frame_ = false;
+    pipeline_drop_window_wait_us_ += pipeline_wait_used_us_;
+    pipeline_drop_window_wait_max_us_ =
+        std::max(pipeline_drop_window_wait_max_us_, pipeline_wait_used_us_);
+  }
+  // While a window is pending, every frame end checks its deadline, drops or not: a single drop
+  // followed by quiet frames is logged a second later (a scripted quit's std::_Exit would lose it
+  // if only a later drop closed the window), and a drop after that starts a window of its own
+  // instead of joining an old one.
   if (PipelineDropNowUs() - pipeline_drop_window_start_us_ >= 1000000) {
     LogPipelineDrops(false);
   }
