@@ -2205,9 +2205,9 @@ std::filesystem::path PipelineDropCaptureFolder() {
 
 // A draw IssueDraw dropped because its pipeline wasn't created within the frame's wait budget
 // (async_shader_compilation, pipeline_wait_budget_ms). Only counts; the draw stays dropped as
-// before. "Overwriting" (ClassifyPipelineDropHole): a written channel group of a target whose result
-// doesn't depend on the destination (Xenos has no blend enable bit; dest factor ZERO with ADD or a
-// subtraction is blending off), the kind of draw whose absence leaves the target's old pixels
+// before. "Overwriting" (ClassifyPipelineDropHole): a written channel group of a target whose
+// result doesn't depend on the destination (Xenos has no blend enable bit; dest factor ZERO with ADD
+// or a subtraction is blending off), the kind of draw whose absence leaves the target's old pixels
 // instead of a missing object.
 void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
                                               const Shader* pixel_shader,
@@ -2329,12 +2329,35 @@ D3D12CommandProcessor::PipelineDropHole D3D12CommandProcessor::ClassifyPipelineD
   hole.depth = (used_slots & 1) && normalized_depth_control.z_enable &&
                normalized_depth_control.z_write_enable;
   if ((used_slots & 1) && normalized_depth_control.stencil_enable) {
-    // Stencil written: the front faces' write mask, or the back faces' when they test their own.
-    const bool front = regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0;
-    const bool back =
-        normalized_depth_control.backface_enable &&
-        regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilwritemask != 0;
-    hole.stencil = front || back;
+    // Stencil that can change: a face with a non-zero write mask and an operation other than KEEP
+    // on an outcome that can happen (the stencil test failing unless it always passes, the depth
+    // test failing only when it is on and can fail, passing unless the stencil test never passes).
+    // The back faces count when they have their own state; otherwise they use the front's.
+    const bool z_can_fail = normalized_depth_control.z_enable &&
+                            normalized_depth_control.zfunc != xenos::CompareFunction::kAlways;
+    auto face_changes = [z_can_fail](uint32_t write_mask, xenos::CompareFunction func,
+                                     xenos::StencilOp fail, xenos::StencilOp zfail,
+                                     xenos::StencilOp zpass) {
+      if (!write_mask) {
+        return false;
+      }
+      const bool fail_reachable = func != xenos::CompareFunction::kAlways;
+      const bool pass_reachable = func != xenos::CompareFunction::kNever;
+      return (fail_reachable && fail != xenos::StencilOp::kKeep) ||
+             (pass_reachable && z_can_fail && zfail != xenos::StencilOp::kKeep) ||
+             (pass_reachable && zpass != xenos::StencilOp::kKeep);
+    };
+    hole.stencil = face_changes(regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask,
+                                normalized_depth_control.stencilfunc,
+                                normalized_depth_control.stencilfail,
+                                normalized_depth_control.stencilzfail,
+                                normalized_depth_control.stencilzpass);
+    if (!hole.stencil && normalized_depth_control.backface_enable) {
+      hole.stencil = face_changes(
+          regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilwritemask,
+          normalized_depth_control.stencilfunc_bf, normalized_depth_control.stencilfail_bf,
+          normalized_depth_control.stencilzfail_bf, normalized_depth_control.stencilzpass_bf);
+    }
   }
   return hole;
 }
