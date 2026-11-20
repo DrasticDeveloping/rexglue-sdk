@@ -2460,18 +2460,19 @@ void D3D12CommandProcessor::LogPipelineDrops(bool at_exit) {
         "Pipeline wait: {} draws dropped in {} frames over the last {} ms, {} overwriting (colour "
         "written without blending), {} writing depth; waited {:.1f} ms in those frames (at most "
         "{:.1f} ms in one, budget {} ms); first: pipeline {} VS {:016X} PS {:016X} ({}); {} more "
-        "of failed pipelines; window {}",
+        "of failed pipelines; window {}{}{}",
         w.draws, w.frames, (PipelineDropNowUs() - pipeline_drop_window_start_us_) / 1000,
         w.overwriting, w.depth, pipeline_drop_window_wait_us_ / 1000.0,
         pipeline_drop_window_wait_max_us_ / 1000.0, REXCVAR_GET(pipeline_wait_budget_ms),
         pipeline_drop_first_handle_, pipeline_drop_first_vs_hash_, pipeline_drop_first_ps_hash_,
         pipeline_drop_first_overwriting_ ? "overwriting" : "blended or no colour", w.failed,
-        pipeline_drop_window_number_);
-    if (!pipeline_drop_window_pictures_.empty()) {
-      // pipeline_drop_capture: the window's saved pictures, on a line of their own right after.
-      REXGPU_INFO("Pipeline wait: that window's pictures: {}", pipeline_drop_window_pictures_);
-      pipeline_drop_window_pictures_.clear();
-    }
+        pipeline_drop_window_number_,
+        // pipeline_drop_capture: the pictures taken in this window, in this same line, so the line
+        // alone ties the window to its pictures (each confirmed by the writer's "saved as" line
+        // naming this window).
+        pipeline_drop_window_pictures_.empty() ? "" : "; pictures ",
+        pipeline_drop_window_pictures_);
+    pipeline_drop_window_pictures_.clear();
     pipeline_drops_window_ = {};
     pipeline_drop_window_wait_us_ = 0;
     pipeline_drop_window_wait_max_us_ = 0;

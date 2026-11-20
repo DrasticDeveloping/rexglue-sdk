@@ -826,7 +826,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t pipeline_drop_frame_depth_ = 0;
   uint32_t pipeline_drop_captures_saved_ = 0;
   bool pipeline_drop_capture_limit_logged_ = false;
-  // The pictures saved in the open window, for its line ("; pictures <names>").
+  // The pictures taken in the open window, named at the end of its own line ("; pictures <names>").
   std::string pipeline_drop_window_pictures_;
   // The open window's number (1, 2, ... in a run), in its line and in the lines of the pictures
   // taken in it, which the writer logs later.
