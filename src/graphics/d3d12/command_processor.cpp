@@ -2362,16 +2362,42 @@ D3D12CommandProcessor::PipelineDropHole D3D12CommandProcessor::ClassifyPipelineD
   return hole;
 }
 
-// pipeline_wait_hole_draws: one draw waited `wait_us` for its pipeline instead of being dropped.
-void D3D12CommandProcessor::CountPipelineHoleWait(int64_t wait_us, const PipelineDropHole& hole) {
-  if (!pipeline_hole_waits_window_.draws) {
+// pipeline_wait_hole_draws: one hole-making draw whose pipeline wasn't ready, and what came of it.
+// A failed creation opens no window of its own (a failed pipeline's draws come every frame); it
+// goes into an open window and the total, and its pipeline gets one line the first time.
+void D3D12CommandProcessor::CountPipelineHoleWait(int64_t wait_us, const PipelineDropHole& hole,
+                                                  PipelineHoleWaitOutcome outcome,
+                                                  void* pipeline_handle,
+                                                  const Shader& vertex_shader,
+                                                  const Shader* pixel_shader) {
+  if (outcome == PipelineHoleWaitOutcome::kFailed) {
+    if (pipeline_hole_waits_window_.draws || pipeline_hole_waits_window_.timed_out) {
+      ++pipeline_hole_waits_window_.failed;
+    }
+    ++pipeline_hole_waits_total_.failed;
+    if (pipeline_hole_failed_logged_.insert(pipeline_handle).second) {
+      REXGPU_WARN(
+          "Pipeline wait: pipeline {} VS {:016X} PS {:016X} failed to create; its draws that would "
+          "leave a hole ({}{}{}) are dropped",
+          pipeline_handle, vertex_shader.ucode_data_hash(),
+          pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+          hole.overwriting ? "overwriting " : "", hole.depth ? "depth " : "",
+          hole.stencil ? "stencil" : "");
+    }
+    return;
+  }
+  if (!pipeline_hole_waits_window_.draws && !pipeline_hole_waits_window_.timed_out) {
     pipeline_hole_wait_window_start_us_ = PipelineDropNowUs();
   }
   for (PipelineHoleWaitCounts* counts :
        {&pipeline_hole_waits_window_, &pipeline_hole_waits_total_}) {
-    ++counts->draws;
-    counts->overwriting += hole.overwriting;
-    counts->depth_or_stencil += hole.depth || hole.stencil;
+    if (outcome == PipelineHoleWaitOutcome::kDrawn) {
+      ++counts->draws;
+      counts->overwriting += hole.overwriting;
+      counts->depth_or_stencil += hole.depth || hole.stencil;
+    } else {
+      ++counts->timed_out;
+    }
     counts->wait_us += wait_us;
   }
   pipeline_hole_wait_this_frame_ = true;
@@ -2379,8 +2405,8 @@ void D3D12CommandProcessor::CountPipelineHoleWait(int64_t wait_us, const Pipelin
 }
 
 void D3D12CommandProcessor::FinishPipelineHoleWaitFrame() {
-  // No window pending: one test on a frame end.
-  if (!pipeline_hole_waits_window_.draws) {
+  // No window pending: two tests on a frame end.
+  if (!pipeline_hole_waits_window_.draws && !pipeline_hole_waits_window_.timed_out) {
     return;
   }
   if (pipeline_hole_wait_this_frame_) {
@@ -2400,7 +2426,7 @@ void D3D12CommandProcessor::FinishPipelineHoleWaitFrame() {
 // One line per window with waits, at most one a second (the window's first wait to the first frame
 // end a second later); at exit the open window's line and the summary, zeros included.
 void D3D12CommandProcessor::LogPipelineHoleWaits(bool at_exit) {
-  if (pipeline_hole_waits_window_.draws) {
+  if (pipeline_hole_waits_window_.draws || pipeline_hole_waits_window_.timed_out) {
     if (pipeline_hole_wait_this_frame_) {
       // At exit with the frame still open.
       pipeline_hole_wait_this_frame_ = false;
@@ -2415,17 +2441,20 @@ void D3D12CommandProcessor::LogPipelineHoleWaits(bool at_exit) {
     REXGPU_INFO(
         "Pipeline wait: {} draws waited for their pipelines in {} frames over the last {} ms (they "
         "would have left holes: {} overwriting, {} writing depth or stencil); {:.1f} ms in all, at "
-        "most {:.1f} ms in one frame (pipeline_wait_hole_draws)",
+        "most {:.1f} ms in one frame; {} timed out, {} of failed pipelines "
+        "(pipeline_wait_hole_draws)",
         w.draws, w.frames, (PipelineDropNowUs() - pipeline_hole_wait_window_start_us_) / 1000,
-        w.overwriting, w.depth_or_stencil, w.wait_us / 1000.0, w.frame_max_us / 1000.0);
+        w.overwriting, w.depth_or_stencil, w.wait_us / 1000.0, w.frame_max_us / 1000.0,
+        w.timed_out, w.failed);
     pipeline_hole_waits_window_ = {};
   }
   if (at_exit) {
     const PipelineHoleWaitCounts& t = pipeline_hole_waits_total_;
     REXGPU_INFO(
         "Pipeline wait: {} draws waited for their pipelines in all, in {} frames, {:.1f} ms in "
-        "all, at most {:.1f} ms in one frame (pipeline_wait_hole_draws {})",
-        t.draws, t.frames, t.wait_us / 1000.0, t.frame_max_us / 1000.0,
+        "all, at most {:.1f} ms in one frame; {} timed out, {} of failed pipelines "
+        "(pipeline_wait_hole_draws {})",
+        t.draws, t.frames, t.wait_us / 1000.0, t.frame_max_us / 1000.0, t.timed_out, t.failed,
         REXCVAR_GET(pipeline_wait_hole_draws) ? "on" : "off");
   }
 }
@@ -3313,8 +3342,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // frame don't add their own waits to the hitch.
       pipeline_wait_used_us_ += waited_us;
       if (wait_whole) {
-        CountPipelineHoleWait(waited_us, hole);
-        if (!waited && !pipeline_cache_->IsPipelineCreationFailed(pipeline_handle)) {
+        const bool failed = !waited && pipeline_cache_->IsPipelineCreationFailed(pipeline_handle);
+        CountPipelineHoleWait(waited_us, hole,
+                              waited   ? PipelineHoleWaitOutcome::kDrawn
+                              : failed ? PipelineHoleWaitOutcome::kFailed
+                                       : PipelineHoleWaitOutcome::kTimedOut,
+                              pipeline_handle, *vertex_shader, pixel_shader);
+        if (!waited && !failed) {
           pipeline_hole_wait_gave_up_ = true;
           REXGPU_WARN(
               "Pipeline wait: a draw that would leave a hole waited {} s for its pipeline, still "

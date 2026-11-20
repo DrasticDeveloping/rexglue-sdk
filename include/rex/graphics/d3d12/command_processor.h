@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -814,19 +815,30 @@ class D3D12CommandProcessor : public CommandProcessor {
   void CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
                          const Shader* pixel_shader, const PipelineDropHole& hole,
                          bool creation_failed);
-  // pipeline_wait_hole_draws: the draws that waited for their pipeline because dropping them would
-  // leave a hole, counted like the drops: a line at most once a second while any waited, and a
-  // summary at exit, so what the waits cost is a number.
+  // pipeline_wait_hole_draws: the hole-making draws whose pipeline wasn't ready, counted apart by
+  // what came of them: `draws`, waited and drawn (the fix's rescues); `timed_out`, waited until a
+  // limit ended the wait with the pipeline still being created (dropped); `failed`, their
+  // pipeline's creation had failed (dropped; each such pipeline also gets one line of its own, so
+  // the loss is always in the log). A line at most once a second while any waited or timed out, and a summary
+  // at exit, so what the waits cost and what they missed are numbers.
   struct PipelineHoleWaitCounts {
     uint64_t draws = 0;
+    uint64_t timed_out = 0;
+    uint64_t failed = 0;
     uint64_t frames = 0;
+    // Of the draws that waited and drew.
     uint64_t overwriting = 0;
     uint64_t depth_or_stencil = 0;
+    // The time spent waiting (drawn or timed out), and the most one frame waited in all.
     int64_t wait_us = 0;
-    // The most one frame waited in all.
     int64_t frame_max_us = 0;
   };
-  void CountPipelineHoleWait(int64_t wait_us, const PipelineDropHole& hole);
+  enum class PipelineHoleWaitOutcome { kDrawn, kTimedOut, kFailed };
+  void CountPipelineHoleWait(int64_t wait_us, const PipelineDropHole& hole,
+                             PipelineHoleWaitOutcome outcome, void* pipeline_handle,
+                             const Shader& vertex_shader, const Shader* pixel_shader);
+  // The pipelines whose failed creation has had its line (CountPipelineHoleWait, kFailed).
+  std::unordered_set<void*> pipeline_hole_failed_logged_;
   // At a frame's end (IssueSwap): the frame's waits into the window, and the window's line once
   // due.
   void FinishPipelineHoleWaitFrame();
