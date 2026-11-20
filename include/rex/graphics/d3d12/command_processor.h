@@ -779,10 +779,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Draws IssueDraw drops because their pipeline is still being created when the frame's
   // pipeline_wait_budget_ms has run out (async_shader_compilation). Nothing logged them before,
   // and a dropped draw that writes colour without blending leaves the old contents of its render
-  // target in the picture (Swap Force Online, 2026-11-19: flat black and cyan screen cells beside
-  // attack effects in a two-game session that started with an empty pipeline cache). The counting
-  // runs only on the drop path, and the frame end only tests a flag when nothing was dropped, so a
-  // session without drops pays nothing.
+  // target in the picture for that frame (render_target_cache_->Update has already claimed the
+  // targets), a flat hole rather than a missing object. The counting runs only on the drop path,
+  // and the frame end only tests a flag when nothing was dropped, so a session without drops pays
+  // nothing.
   struct PipelineDropCounts {
     uint64_t draws = 0;
     uint64_t frames = 0;
