@@ -2045,8 +2045,20 @@ void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shade
                                               uint32_t normalized_color_mask,
                                               reg::RB_DEPTHCONTROL normalized_depth_control) {
   const RegisterFile& regs = *register_file_;
+  // On the host render target path only the targets the render target cache really gave this draw
+  // count (bit 0 depth, 1... color): it leaves out a color target sharing its EDRAM base with a
+  // lower slot and a depth target sharing one with a color target, and binds none without
+  // rasterization (RenderTargetCache::Update). The interlock (ROV) path binds no host targets; it
+  // keeps the register state as it is.
+  uint32_t used_slots = render_target_cache_->GetPath() ==
+                                RenderTargetCache::Path::kHostRenderTargets
+                            ? render_target_cache_->GetLastUpdateUsedRenderTargetBits()
+                            : ~uint32_t(0);
   bool overwriting = false;
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets && !overwriting; ++i) {
+    if (!(used_slots & (uint32_t(1) << (1 + i)))) {
+      continue;
+    }
     // Only the channels the target's format has: GetNormalizedColorMask marks the absent ones as
     // written (util/draw.cpp, for the host driver's fast path), so on a one-channel target an alpha
     // blend that writes nothing would otherwise hide a red channel written without blending.
@@ -2070,7 +2082,8 @@ void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shade
                              blend.alpha_comb_fcn == xenos::BlendOp::kAdd);
     overwriting = color_overwrites && alpha_overwrites;
   }
-  bool depth = normalized_depth_control.z_enable && normalized_depth_control.z_write_enable;
+  bool depth = (used_slots & 1) && normalized_depth_control.z_enable &&
+               normalized_depth_control.z_write_enable;
   if (!pipeline_drops_window_.draws) {
     pipeline_drop_window_start_us_ = PipelineDropNowUs();
     pipeline_drop_first_handle_ = pipeline_handle;
