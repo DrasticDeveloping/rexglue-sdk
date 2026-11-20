@@ -798,9 +798,48 @@ class D3D12CommandProcessor : public CommandProcessor {
     // logged the failure once; a failed pipeline's draws come every frame).
     uint64_t failed = 0;
   };
+  // What a draw whose pipeline isn't ready would leave behind if dropped, from the targets the
+  // render target cache really gave it (host render target path; the interlock path reads the
+  // register state): `overwriting`, colour written without blending to a target; `depth`, depth
+  // written; `stencil`, stencil written. Any of them: a hole (the targets' old contents) for that
+  // frame. None: a blended draw or one writing nothing, an object missing for a frame.
+  struct PipelineDropHole {
+    bool overwriting = false;
+    bool depth = false;
+    bool stencil = false;
+  };
+  PipelineDropHole ClassifyPipelineDropHole(uint32_t normalized_color_mask,
+                                            reg::RB_DEPTHCONTROL normalized_depth_control) const;
   void CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
-                         const Shader* pixel_shader, uint32_t normalized_color_mask,
-                         reg::RB_DEPTHCONTROL normalized_depth_control, bool creation_failed);
+                         const Shader* pixel_shader, const PipelineDropHole& hole,
+                         bool creation_failed);
+  // pipeline_wait_hole_draws: the draws that waited for their pipeline because dropping them would
+  // leave a hole, counted like the drops: a line at most once a second while any waited, and a
+  // summary at exit, so what the waits cost is a number.
+  struct PipelineHoleWaitCounts {
+    uint64_t draws = 0;
+    uint64_t frames = 0;
+    uint64_t overwriting = 0;
+    uint64_t depth_or_stencil = 0;
+    int64_t wait_us = 0;
+    // The most one frame waited in all.
+    int64_t frame_max_us = 0;
+  };
+  void CountPipelineHoleWait(int64_t wait_us, const PipelineDropHole& hole);
+  // At a frame's end (IssueSwap): the frame's waits into the window, and the window's line once
+  // due.
+  void FinishPipelineHoleWaitFrame();
+  void LogPipelineHoleWaits(bool at_exit);
+  PipelineHoleWaitCounts pipeline_hole_waits_window_;
+  PipelineHoleWaitCounts pipeline_hole_waits_total_;
+  bool pipeline_hole_wait_this_frame_ = false;
+  int64_t pipeline_hole_wait_frame_us_ = 0;
+  int64_t pipeline_hole_wait_window_start_us_ = 0;
+  // Set when a hole-making draw waited the whole safety limit (kPipelineHoleWaitLimitUs) and its
+  // pipeline was still being created: from then on such draws keep the budget, as before the fix,
+  // so a creation that never ends can't stop the game for good.
+  bool pipeline_hole_wait_gave_up_ = false;
+  static constexpr int64_t kPipelineHoleWaitLimitUs = 10 * 1000 * 1000;
   // At a frame's end (IssueSwap, before the wait budget is reset). check_deadline false: the
   // window's line waits (LogPipelineDropsIfDue later in the same swap) for this frame's saved
   // picture.
