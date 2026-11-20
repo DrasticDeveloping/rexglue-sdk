@@ -810,8 +810,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // output IssueSwap has just refreshed) saved next to the log when the frame dropped a draw that
   // overwrites colour or writes depth, at most pipeline_drop_capture_max a run. `overwriting` and
   // `depth`: that frame's counts, for its line.
+  // `source_width` x `source_height`: the active part of the guest output (the swap's
+  // guest_output_width/height); `output_width` x `output_height`: the active guest front buffer's
+  // own size, the picture's.
   void CapturePipelineDropFrame(ui::Presenter& presenter, uint64_t frame, uint32_t overwriting,
-                                uint32_t depth);
+                                uint32_t depth, uint32_t source_width, uint32_t source_height,
+                                uint32_t output_width, uint32_t output_height);
   // Set on the drop path only (CountPipelineDrop, with the setting on): this frame dropped an
   // overwriting or depth-writing draw, and how many of each; IssueSwap tests the flag once a frame.
   bool pipeline_drop_capture_wanted_ = false;

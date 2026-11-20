@@ -2287,11 +2287,16 @@ void D3D12CommandProcessor::LogPipelineDropsIfDue() {
 
 // pipeline_drop_capture: this frame's final picture, the guest output the swap has just refreshed
 // (only the command processor refreshes it, so the newest one CaptureGuestOutput takes is this
-// frame's; it waits until the frame's submission is on the queue and done). Every scale-th pixel of
-// the draw resolution scale, so the file has the guest's size. Named with the frame (the command
-// processor's frame number) and the local time to the millisecond, matching the log's stamps.
+// frame's; it waits until the frame's submission is on the queue and done). Point-sampled from the
+// guest output's active part to the active guest front buffer's own size, whatever the swap source's
+// scale (a title can present an unscaled source with draw resolution scaling on). Named with the
+// frame (the command processor's frame number) and the local time to the millisecond, matching the
+// log's stamps.
 void D3D12CommandProcessor::CapturePipelineDropFrame(ui::Presenter& presenter, uint64_t frame,
-                                                     uint32_t overwriting, uint32_t depth) {
+                                                     uint32_t overwriting, uint32_t depth,
+                                                     uint32_t source_width, uint32_t source_height,
+                                                     uint32_t output_width,
+                                                     uint32_t output_height) {
   const uint32_t max = uint32_t(std::max(0, REXCVAR_GET(pipeline_drop_capture_max)));
   if (pipeline_drop_captures_saved_ >= max) {
     if (!pipeline_drop_capture_limit_logged_) {
@@ -2305,16 +2310,20 @@ void D3D12CommandProcessor::CapturePipelineDropFrame(ui::Presenter& presenter, u
     REXGPU_WARN("Pipeline wait: frame {} not saved (no guest output picture)", frame);
     return;
   }
-  const uint32_t step_x = std::max(uint32_t(1), texture_cache_->draw_resolution_scale_x());
-  const uint32_t step_y = std::max(uint32_t(1), texture_cache_->draw_resolution_scale_y());
-  const uint32_t width = image.width / step_x;
-  const uint32_t height = image.height / step_y;
+  // The active part, never past the captured image; the output at the front buffer's size (the
+  // active part's own when that is unknown).
+  const uint32_t src_width = std::min(source_width ? source_width : image.width, image.width);
+  const uint32_t src_height = std::min(source_height ? source_height : image.height, image.height);
+  const uint32_t width = output_width ? output_width : src_width;
+  const uint32_t height = output_height ? output_height : src_height;
   std::vector<uint8_t> rgb(size_t(width) * height * 3);
   for (uint32_t y = 0; y < height; ++y) {
-    const uint8_t* src = image.data.data() + size_t(y) * step_y * image.stride;
+    const uint32_t src_y = uint32_t(uint64_t(y) * src_height / height);
+    const uint8_t* src = image.data.data() + size_t(src_y) * image.stride;
     uint8_t* dst = rgb.data() + size_t(y) * width * 3;
     for (uint32_t x = 0; x < width; ++x) {
-      std::memcpy(dst + size_t(x) * 3, src + size_t(x) * step_x * 4, 3);  // R8 G8 B8 X8
+      const uint32_t src_x = uint32_t(uint64_t(x) * src_width / width);
+      std::memcpy(dst + size_t(x) * 3, src + size_t(src_x) * 4, 3);  // R8 G8 B8 X8
     }
   }
   const auto now = std::chrono::system_clock::now();
@@ -2826,8 +2835,20 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // work submitted; then the window's deadline, held back above for it.
   if (capture_frame) {
     if (refreshed) {
-      CapturePipelineDropFrame(*presenter, capture_frame_number, capture_overwriting,
-                               capture_depth);
+      // The active guest front buffer's own size: the swap packet's, within the source's unscaled
+      // size (as get_active_swap_dimension takes it), else the source's, else the output's.
+      auto active_unscaled = [](uint32_t packet, uint32_t source_unscaled, uint32_t output) {
+        uint32_t active = packet ? packet : source_unscaled;
+        if (active && source_unscaled) {
+          active = std::min(active, source_unscaled);
+        }
+        return active ? active : output;
+      };
+      CapturePipelineDropFrame(
+          *presenter, capture_frame_number, capture_overwriting, capture_depth,
+          guest_output_width, guest_output_height,
+          active_unscaled(frontbuffer_width, frontbuffer_width_unscaled, guest_output_width),
+          active_unscaled(frontbuffer_height, frontbuffer_height_unscaled, guest_output_height));
     }
     LogPipelineDropsIfDue();
   }
