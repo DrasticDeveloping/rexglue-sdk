@@ -111,6 +111,13 @@ class PipelineCache {
     }
     return pipeline->state.load(std::memory_order_acquire);
   }
+  // Whether the pipeline behind the handle has finished creation without a pipeline (a failure,
+  // logged by its creation), as opposed to one still being created. For the dropped-draw counter.
+  bool IsPipelineCreationFailed(void* handle) const {
+    const Pipeline* pipeline = reinterpret_cast<const Pipeline*>(handle);
+    return pipeline->done.load(std::memory_order_acquire) &&
+           !pipeline->state.load(std::memory_order_acquire);
+  }
 
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {

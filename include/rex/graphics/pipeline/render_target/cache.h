@@ -190,6 +190,12 @@ class RenderTargetCache {
   // formats (resource formats, but if needed, with gamma taken into account) of
   // each.
   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
+  // Host render target path only (0 on the others): bits (0 depth, 1... color) of the render
+  // targets the last update gave this draw itself. Unlike GetLastUpdateBoundRenderTargets, it
+  // leaves out the ones kept bound from earlier draws, a target dropped because another one shares
+  // its EDRAM base, and every target when rasterization doesn't happen. For the dropped-draw
+  // counter (D3D12CommandProcessor::CountPipelineDrop).
+  uint32_t GetLastUpdateUsedRenderTargetBits() const;
 
  protected:
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,

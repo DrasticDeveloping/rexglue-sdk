@@ -775,6 +775,47 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t pixel_constant_override_generation_ = 0;
   // pipeline_wait_budget_ms: how long this frame's draws have waited for pipelines so far.
   int64_t pipeline_wait_used_us_ = 0;
+
+  // Draws IssueDraw drops because their pipeline is still being created when the frame's
+  // pipeline_wait_budget_ms has run out (async_shader_compilation). Nothing logged them before,
+  // and a dropped draw that writes colour without blending leaves the old contents of its render
+  // target in the picture for that frame (render_target_cache_->Update has already claimed the
+  // targets), a flat hole rather than a missing object. The counting runs only on the drop path,
+  // and the frame end only tests a flag when nothing was dropped, so a session without drops pays
+  // nothing.
+  struct PipelineDropCounts {
+    uint64_t draws = 0;
+    uint64_t frames = 0;
+    // Wrote colour to a render target without blending (src ONE, dest ZERO, add, for every written
+    // channel): the pixels it should have written keep what the target held before.
+    uint64_t overwriting = 0;
+    // Had depth writes on.
+    uint64_t depth = 0;
+    // Dropped because their pipeline's creation had FAILED (not pending): dropped the same way, but
+    // counted apart and not in the counts above, opening no window of their own (the creation
+    // logged the failure once; a failed pipeline's draws come every frame).
+    uint64_t failed = 0;
+  };
+  void CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
+                         const Shader* pixel_shader, uint32_t normalized_color_mask,
+                         reg::RB_DEPTHCONTROL normalized_depth_control, bool creation_failed);
+  // At a frame's end (IssueSwap, before the wait budget is reset).
+  void FinishPipelineDropFrame();
+  void LogPipelineDrops(bool at_exit);
+  PipelineDropCounts pipeline_drops_window_;
+  PipelineDropCounts pipeline_drops_total_;
+  bool pipeline_drop_this_frame_ = false;
+  // A line covers a window: from its first drop (steady clock, microseconds) until a frame ends at
+  // least a second later.
+  int64_t pipeline_drop_window_start_us_ = 0;
+  // Wait budget used in the window's frames that dropped draws: all of them, and the most in one.
+  int64_t pipeline_drop_window_wait_us_ = 0;
+  int64_t pipeline_drop_window_wait_max_us_ = 0;
+  // The window's first dropped draw.
+  void* pipeline_drop_first_handle_ = nullptr;
+  uint64_t pipeline_drop_first_vs_hash_ = 0;
+  uint64_t pipeline_drop_first_ps_hash_ = 0;
+  bool pipeline_drop_first_overwriting_ = false;
   ConstantBufferBinding cbuffer_binding_bool_loop_;
   ConstantBufferBinding cbuffer_binding_fetch_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;

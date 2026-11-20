@@ -1712,6 +1712,8 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  // The last window's line (if it dropped any) and the session's summary line.
+  LogPipelineDrops(true);
   AwaitAllQueueOperationsCompletion();
   ShutdownSubmitThread();
   InvalidateAllVertexBufferResidency();
@@ -2025,6 +2027,150 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_up_to_date_ = false;
 }
 
+namespace {
+int64_t PipelineDropNowUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+// A draw IssueDraw dropped because its pipeline wasn't created within the frame's wait budget
+// (async_shader_compilation, pipeline_wait_budget_ms). Only counts; the draw stays dropped as
+// before. "Overwriting": at least one colour target written whose written channels all have
+// src ONE, dest ZERO, add (Xenos has no blend enable bit; that is blending off), the kind of draw
+// whose absence leaves the target's old pixels instead of a missing object.
+void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
+                                              const Shader* pixel_shader,
+                                              uint32_t normalized_color_mask,
+                                              reg::RB_DEPTHCONTROL normalized_depth_control,
+                                              bool creation_failed) {
+  if (creation_failed) {
+    // A failed pipeline, not a pending one: its own counter, into a window already open and the
+    // session's total, and no window of its own (PipelineDropCounts::failed).
+    if (pipeline_drops_window_.draws) {
+      ++pipeline_drops_window_.failed;
+    }
+    ++pipeline_drops_total_.failed;
+    return;
+  }
+  const RegisterFile& regs = *register_file_;
+  // On the host render target path only the targets the render target cache really gave this draw
+  // count (bit 0 depth, 1... color): it leaves out a color target sharing its EDRAM base with a
+  // lower slot and a depth target sharing one with a color target, and binds none without
+  // rasterization (RenderTargetCache::Update). The interlock (ROV) path binds no host targets; it
+  // keeps the register state as it is.
+  uint32_t used_slots = render_target_cache_->GetPath() ==
+                                RenderTargetCache::Path::kHostRenderTargets
+                            ? render_target_cache_->GetLastUpdateUsedRenderTargetBits()
+                            : ~uint32_t(0);
+  bool overwriting = false;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets && !overwriting; ++i) {
+    if (!(used_slots & (uint32_t(1) << (1 + i)))) {
+      continue;
+    }
+    // Only the channels the target's format has: GetNormalizedColorMask marks the absent ones as
+    // written (util/draw.cpp, for the host driver's fast path), so on a one-channel target an alpha
+    // blend that writes nothing would otherwise hide a red channel written without blending.
+    auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+    uint32_t format_components =
+        (uint32_t(1) << xenos::GetColorRenderTargetFormatComponentCount(color_info.color_format)) -
+        1;
+    uint32_t mask = (normalized_color_mask >> (4 * i)) & format_components;
+    if (!mask) {
+      continue;
+    }
+    auto blend =
+        regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    bool color_overwrites = !(mask & 0b0111) ||
+                            (blend.color_srcblend == xenos::BlendFactor::kOne &&
+                             blend.color_destblend == xenos::BlendFactor::kZero &&
+                             blend.color_comb_fcn == xenos::BlendOp::kAdd);
+    bool alpha_overwrites = !(mask & 0b1000) ||
+                            (blend.alpha_srcblend == xenos::BlendFactor::kOne &&
+                             blend.alpha_destblend == xenos::BlendFactor::kZero &&
+                             blend.alpha_comb_fcn == xenos::BlendOp::kAdd);
+    overwriting = color_overwrites && alpha_overwrites;
+  }
+  bool depth = (used_slots & 1) && normalized_depth_control.z_enable &&
+               normalized_depth_control.z_write_enable;
+  if (!pipeline_drops_window_.draws) {
+    pipeline_drop_window_start_us_ = PipelineDropNowUs();
+    pipeline_drop_first_handle_ = pipeline_handle;
+    pipeline_drop_first_vs_hash_ = vertex_shader.ucode_data_hash();
+    pipeline_drop_first_ps_hash_ = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+    pipeline_drop_first_overwriting_ = overwriting;
+  }
+  for (PipelineDropCounts* counts : {&pipeline_drops_window_, &pipeline_drops_total_}) {
+    ++counts->draws;
+    if (!pipeline_drop_this_frame_) {
+      ++counts->frames;
+    }
+    counts->overwriting += overwriting;
+    counts->depth += depth;
+  }
+  pipeline_drop_this_frame_ = true;
+}
+
+void D3D12CommandProcessor::FinishPipelineDropFrame() {
+  // No window pending: one test on a frame end.
+  if (!pipeline_drops_window_.draws) {
+    return;
+  }
+  // The wait budget counts only for the frames that dropped draws.
+  if (pipeline_drop_this_frame_) {
+    pipeline_drop_this_frame_ = false;
+    pipeline_drop_window_wait_us_ += pipeline_wait_used_us_;
+    pipeline_drop_window_wait_max_us_ =
+        std::max(pipeline_drop_window_wait_max_us_, pipeline_wait_used_us_);
+  }
+  // While a window is pending, every frame end checks its deadline, drops or not: a single drop
+  // followed by quiet frames is logged a second later (a scripted quit's std::_Exit would lose it
+  // if only a later drop closed the window), and a drop after that starts a window of its own
+  // instead of joining an old one.
+  if (PipelineDropNowUs() - pipeline_drop_window_start_us_ >= 1000000) {
+    LogPipelineDrops(false);
+  }
+}
+
+// One line per window with drops, at most one a second (a window ends at the first frame end a
+// second or more after its first drop); at exit the open window's line and the summary, which is
+// written even when nothing was dropped (a run without drops shows it).
+void D3D12CommandProcessor::LogPipelineDrops(bool at_exit) {
+  if (pipeline_drops_window_.draws) {
+    if (pipeline_drop_this_frame_) {
+      // At exit with the frame still open.
+      pipeline_drop_this_frame_ = false;
+      pipeline_drop_window_wait_us_ += pipeline_wait_used_us_;
+      pipeline_drop_window_wait_max_us_ =
+          std::max(pipeline_drop_window_wait_max_us_, pipeline_wait_used_us_);
+    }
+    const PipelineDropCounts& w = pipeline_drops_window_;
+    REXGPU_INFO(
+        "Pipeline wait: {} draws dropped in {} frames over the last {} ms, {} overwriting (colour "
+        "written without blending), {} writing depth; waited {:.1f} ms in those frames (at most "
+        "{:.1f} ms in one, budget {} ms); first: pipeline {} VS {:016X} PS {:016X} ({}); {} more "
+        "of failed pipelines",
+        w.draws, w.frames, (PipelineDropNowUs() - pipeline_drop_window_start_us_) / 1000,
+        w.overwriting, w.depth, pipeline_drop_window_wait_us_ / 1000.0,
+        pipeline_drop_window_wait_max_us_ / 1000.0, REXCVAR_GET(pipeline_wait_budget_ms),
+        pipeline_drop_first_handle_, pipeline_drop_first_vs_hash_, pipeline_drop_first_ps_hash_,
+        pipeline_drop_first_overwriting_ ? "overwriting" : "blended or no colour", w.failed);
+    pipeline_drops_window_ = {};
+    pipeline_drop_window_wait_us_ = 0;
+    pipeline_drop_window_wait_max_us_ = 0;
+  }
+  if (at_exit) {
+    const PipelineDropCounts& t = pipeline_drops_total_;
+    REXGPU_INFO(
+        "Pipeline wait: {} draws dropped in all, in {} frames, {} overwriting, {} writing depth, "
+        "{} more of failed pipelines (async_shader_compilation {}, pipeline_wait_budget_ms {})",
+        t.draws, t.frames, t.overwriting, t.depth, t.failed,
+        REXCVAR_GET(async_shader_compilation) ? "on" : "off",
+        REXCVAR_GET(pipeline_wait_budget_ms));
+  }
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
@@ -2035,6 +2181,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // coordinates and came out green on the right and bottom). Once per frame, every vertex buffer is
   // requested again.
   InvalidateAllVertexBufferResidency();
+  // The frame's dropped draws (CountPipelineDrop), while its wait budget use is still known.
+  FinishPipelineDropFrame();
   // A new frame gets the whole pipeline_wait_budget_ms again.
   pipeline_wait_used_us_ = 0;
 
@@ -2625,6 +2773,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                     .count();
     }
     if (!waited) {
+      // Dropped: counted and logged (CountPipelineDrop). The render target cache's Update above
+      // has already claimed and transferred the targets, so the pixels this draw would have
+      // written keep the targets' old contents for this frame. A pipeline whose creation failed
+      // (WaitForPipeline returns nullptr for it with time left too) is told apart from one still
+      // being created and counted on its own; the drop and the wait accounting are the same.
+      CountPipelineDrop(pipeline_handle, *vertex_shader, pixel_shader, normalized_color_mask,
+                        normalized_depth_control,
+                        pipeline_cache_->IsPipelineCreationFailed(pipeline_handle));
       return true;
     }
   }
