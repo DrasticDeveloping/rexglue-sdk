@@ -2047,7 +2047,14 @@ void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shade
   const RegisterFile& regs = *register_file_;
   bool overwriting = false;
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets && !overwriting; ++i) {
-    uint32_t mask = (normalized_color_mask >> (4 * i)) & 0xF;
+    // Only the channels the target's format has: GetNormalizedColorMask marks the absent ones as
+    // written (util/draw.cpp, for the host driver's fast path), so on a one-channel target an alpha
+    // blend that writes nothing would otherwise hide a red channel written without blending.
+    auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+    uint32_t format_components =
+        (uint32_t(1) << xenos::GetColorRenderTargetFormatComponentCount(color_info.color_format)) -
+        1;
+    uint32_t mask = (normalized_color_mask >> (4 * i)) & format_components;
     if (!mask) {
       continue;
     }
