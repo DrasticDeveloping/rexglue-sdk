@@ -3459,11 +3459,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // written keep the targets' old contents for this frame. A pipeline whose creation failed
       // (WaitForPipeline returns nullptr for it with time left too) is told apart from one still
       // being created and counted on its own; the drop and the wait accounting are the same.
-      if (!hole_classified) {
+      // A known failure first: its drop needs no classification (the counter's failed branch
+      // doesn't use it), so with pipeline_wait_hole_draws off nothing is classified for it.
+      const bool failed = pipeline_cache_->IsPipelineCreationFailed(pipeline_handle);
+      if (!failed && !hole_classified) {
         hole = ClassifyPipelineDropHole(normalized_color_mask, normalized_depth_control);
       }
-      CountPipelineDrop(pipeline_handle, *vertex_shader, pixel_shader, hole,
-                        pipeline_cache_->IsPipelineCreationFailed(pipeline_handle));
+      // A hole-making draw lost to a failed creation is named here, once per pipeline, whichever
+      // way it came (a failed wait, a pipeline given up first, a frame past its limit).
+      if (failed && hole_classified && (hole.overwriting || hole.depth || hole.stencil) &&
+          pipeline_hole_failed_logged_.insert(pipeline_handle).second) {
+        REXGPU_WARN(
+            "Pipeline wait: pipeline {} VS {:016X} PS {:016X} failed to create; its draws that "
+            "would leave a hole ({}{}{}) are dropped",
+            pipeline_handle, vertex_shader->ucode_data_hash(),
+            pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+            hole.overwriting ? "overwriting " : "", hole.depth ? "depth " : "",
+            hole.stencil ? "stencil" : "");
+      }
+      CountPipelineDrop(pipeline_handle, *vertex_shader, pixel_shader, hole, failed);
       return true;
     }
   }
