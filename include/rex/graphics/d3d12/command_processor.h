@@ -806,8 +806,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Logs the open window's line once its first drop is a second old.
   void LogPipelineDropsIfDue();
   void LogPipelineDrops(bool at_exit);
-  // pipeline_drop_capture (a debug setting, off by default): the frame's final picture (the guest
-  // output IssueSwap has just refreshed) saved next to the log when the frame dropped a draw that
+  // pipeline_drop_capture (a debug setting, off by default): the same swap's guest output (the
+  // image IssueSwap has just refreshed, before the host's scaling and presentation, not necessarily
+  // what reached the screen) saved next to the log when the frame dropped a draw that
   // overwrites colour or writes depth, at most pipeline_drop_capture_max a run. `overwriting` and
   // `depth`: that frame's counts, for its line.
   // `source_width` x `source_height`: the active part of the guest output (the swap's

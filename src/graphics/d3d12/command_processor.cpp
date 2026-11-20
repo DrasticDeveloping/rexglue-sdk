@@ -94,17 +94,21 @@ REXCVAR_DEFINE_INT32(pipeline_wait_budget_ms, 4, "GPU",
 // (async_shader_compilation) is counted and logged (`Pipeline wait:` lines, CountPipelineDrop); one
 // that overwrites colour or writes depth leaves its render targets' old contents in that frame, a
 // hole lasting a frame or two, which a picture taken on a script's timeline almost never catches
-// (pictures on a script's timeline come 100 ms or more apart). With this on, the frame's own
-// final picture (the guest output IssueSwap has just refreshed for that frame) is
-// saved next to the log as pipeline-drop-f<frame>-<HHMMSS>-<ms>.png and named in a line, so one run
-// shows the hole or shows none. Safe: off, nothing changes but one flag test per swap (the flag is
+// (pictures on a script's timeline come 100 ms or more apart). With this on, the same swap's guest
+// output (the image IssueSwap has just refreshed for that frame: the guest's picture after its
+// resolve, gamma and optional FXAA, before the host's filtering, scaling, overlays and
+// presentation; the presenter's mailbox may replace it before it reaches the screen) is saved next
+// to the log as pipeline-drop-f<frame>-<HHMMSS>-<ms>.png and named in a line, so one run shows
+// whether that frame's guest picture has the hole. It says nothing about exactly what the player
+// saw. Safe: off, nothing changes but one flag test per swap (the flag is
 // only set on the drop path, and only with this on); on, the capture waits for that frame's GPU
 // work on the command processor thread (a stall of a frame, at most pipeline_drop_capture_max times
 // a run) and writes an uncompressed PNG there.
 REXCVAR_DEFINE_BOOL(pipeline_drop_capture, false, "GPU",
-                    "Debug: save the final picture of a frame in which a draw that overwrites "
-                    "colour or writes depth was dropped while its pipeline was being created, next "
-                    "to the log (at most pipeline_drop_capture_max a run); it stalls that frame")
+                    "Debug: save the same swap's guest output of a frame in which a draw that "
+                    "overwrites colour or writes depth was dropped while its pipeline was being "
+                    "created, next to the log (at most pipeline_drop_capture_max a run); it stalls "
+                    "that frame")
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
@@ -2285,7 +2289,7 @@ void D3D12CommandProcessor::LogPipelineDropsIfDue() {
   }
 }
 
-// pipeline_drop_capture: this frame's final picture, the guest output the swap has just refreshed
+// pipeline_drop_capture: the same swap's guest output, the image the swap has just refreshed
 // (only the command processor refreshes it, so the newest one CaptureGuestOutput takes is this
 // frame's; it waits until the frame's submission is on the queue and done). Point-sampled from the
 // guest output's active part to the active guest front buffer's own size, whatever the swap source's
@@ -2344,7 +2348,7 @@ void D3D12CommandProcessor::CapturePipelineDropFrame(ui::Presenter& presenter, u
   ++pipeline_drop_captures_saved_;
   REXGPU_INFO(
       "Pipeline wait: frame {} saved as {} ({} overwriting, {} depth-writing draws dropped in it; "
-      "{} of {})",
+      "the same swap's guest output, before the host's scaling and presentation; {} of {})",
       frame, name, overwriting, depth, pipeline_drop_captures_saved_, max);
   if (pipeline_drops_window_.draws) {
     pipeline_drop_window_pictures_ += (pipeline_drop_window_pictures_.empty() ? "" : ", ") + name;
