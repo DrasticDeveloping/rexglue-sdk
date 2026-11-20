@@ -2260,9 +2260,11 @@ namespace {
 // its destination factor is ZERO, its operation adds or subtracts (ADD: src*f, SUBTRACT: src*f - 0,
 // REVSUBTRACT: 0 - src*f), and its source factor reads no destination value. Such a group replaces
 // what the target held, so a dropped draw leaves the old value there. MIN and MAX always read the
-// destination.
+// destination. SRC_ALPHA_SATURATE is min(source alpha, 1 - destination alpha) for the colour group
+// but 1 for the alpha group (dxbc_translator_om.cpp's alpha factor cases), so it reads the
+// destination only in the colour group.
 bool BlendGroupReplacesDestination(xenos::BlendFactor src, xenos::BlendFactor dest,
-                                   xenos::BlendOp op) {
+                                   xenos::BlendOp op, bool alpha_group) {
   if (dest != xenos::BlendFactor::kZero) {
     return false;
   }
@@ -2275,8 +2277,9 @@ bool BlendGroupReplacesDestination(xenos::BlendFactor src, xenos::BlendFactor de
     case xenos::BlendFactor::kOneMinusDstColor:
     case xenos::BlendFactor::kDstAlpha:
     case xenos::BlendFactor::kOneMinusDstAlpha:
-    case xenos::BlendFactor::kSrcAlphaSaturate:  // min(source alpha, 1 - destination alpha)
       return false;
+    case xenos::BlendFactor::kSrcAlphaSaturate:
+      return alpha_group;
     default:
       return true;
   }
@@ -2320,11 +2323,11 @@ D3D12CommandProcessor::PipelineDropHole D3D12CommandProcessor::ClassifyPipelineD
     const bool color_replaces =
         (mask & 0b0111) && BlendGroupReplacesDestination(blend.color_srcblend,
                                                          blend.color_destblend,
-                                                         blend.color_comb_fcn);
+                                                         blend.color_comb_fcn, false);
     const bool alpha_replaces =
         (mask & 0b1000) && BlendGroupReplacesDestination(blend.alpha_srcblend,
                                                          blend.alpha_destblend,
-                                                         blend.alpha_comb_fcn);
+                                                         blend.alpha_comb_fcn, true);
     overwriting = color_replaces || alpha_replaces;
   }
   PipelineDropHole hole;
