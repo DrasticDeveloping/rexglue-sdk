@@ -13,6 +13,9 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <utility>
 
@@ -85,6 +88,30 @@ REXCVAR_DEFINE_INT32(pipeline_wait_budget_ms, 4, "GPU",
                      "With async shader compilation: how long per frame draws may wait for a "
                      "pipeline still being created before they are skipped (0 = skip at once)")
     .range(0, 50)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// A debug setting, off by default. A draw IssueDraw drops because its pipeline isn't created yet
+// (async_shader_compilation) is counted and logged (`Pipeline wait:` lines, CountPipelineDrop); one
+// that overwrites colour or writes depth leaves its render targets' old contents in that frame, a
+// hole lasting a frame or two, which a picture taken on a script's timeline almost never catches
+// (pictures on a script's timeline come 100 ms or more apart). With this on, the frame's own
+// final picture (the guest output IssueSwap has just refreshed for that frame) is
+// saved next to the log as pipeline-drop-f<frame>-<HHMMSS>-<ms>.png and named in a line, so one run
+// shows the hole or shows none. Safe: off, nothing changes but one flag test per swap (the flag is
+// only set on the drop path, and only with this on); on, the capture waits for that frame's GPU
+// work on the command processor thread (a stall of a frame, at most pipeline_drop_capture_max times
+// a run) and writes an uncompressed PNG there.
+REXCVAR_DEFINE_BOOL(pipeline_drop_capture, false, "GPU",
+                    "Debug: save the final picture of a frame in which a draw that overwrites "
+                    "colour or writes depth was dropped while its pipeline was being created, next "
+                    "to the log (at most pipeline_drop_capture_max a run); it stalls that frame")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// pipeline_drop_capture's limit: pictures saved per run (each about 2.8 MB at 1280x720), so a load
+// with hundreds of drops doesn't fill the disk or stall frame after frame.
+REXCVAR_DEFINE_INT32(pipeline_drop_capture_max, 8, "GPU",
+                     "Debug: at most this many pictures saved per run by pipeline_drop_capture")
+    .range(0, 1000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
@@ -2033,6 +2060,99 @@ int64_t PipelineDropNowUs() {
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
+
+// pipeline_drop_capture's file: a PNG of 8-bit RGB rows with deflate's stored (uncompressed)
+// blocks, so the SDK needs no image library; any PNG reader takes it. False if it can't be written.
+bool WriteStoredRgbPng(const std::filesystem::path& path, uint32_t width, uint32_t height,
+                       const std::vector<uint8_t>& rgb) {
+  uint32_t crc_table[256];
+  for (uint32_t n = 0; n < 256; ++n) {
+    uint32_t c = n;
+    for (int k = 0; k < 8; ++k) {
+      c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+    }
+    crc_table[n] = c;
+  }
+  auto put32 = [](std::string& out, uint32_t v) {
+    out.push_back(char(v >> 24));
+    out.push_back(char(v >> 16));
+    out.push_back(char(v >> 8));
+    out.push_back(char(v));
+  };
+  std::string file("\x89PNG\r\n\x1a\n", 8);
+  auto chunk = [&](const char* type, const std::string& body) {
+    put32(file, uint32_t(body.size()));
+    std::string typed(type, 4);
+    typed += body;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (unsigned char b : typed) {
+      crc = crc_table[(crc ^ b) & 0xFF] ^ (crc >> 8);
+    }
+    file += typed;
+    put32(file, crc ^ 0xFFFFFFFFu);
+  };
+  std::string header;
+  put32(header, width);
+  put32(header, height);
+  // 8 bits, RGB, deflate, no filter, no interlace.
+  header += std::string("\x08\x02\x00\x00\x00", 5);
+  chunk("IHDR", header);
+  // The image data: each row is filter byte 0 and the row; zlib around stored blocks of at most
+  // 65535 bytes, with the Adler-32 of the data at the end.
+  const size_t row = size_t(width) * 3;
+  std::string raw;
+  raw.reserve((row + 1) * height);
+  for (uint32_t y = 0; y < height; ++y) {
+    raw.push_back('\0');
+    raw.append(reinterpret_cast<const char*>(rgb.data()) + y * row, row);
+  }
+  std::string zlib("\x78\x01", 2);
+  uint32_t a = 1, b = 0;
+  for (unsigned char c : raw) {
+    a = (a + c) % 65521;
+    b = (b + a) % 65521;
+  }
+  for (size_t at = 0; at < raw.size() || at == 0; at += 65535) {
+    const size_t len = std::min<size_t>(65535, raw.size() - at);
+    const bool last = at + len >= raw.size();
+    zlib.push_back(char(last ? 1 : 0));
+    zlib.push_back(char(len & 0xFF));
+    zlib.push_back(char(len >> 8));
+    zlib.push_back(char(~len & 0xFF));
+    zlib.push_back(char((~len >> 8) & 0xFF));
+    zlib.append(raw, at, len);
+    if (last) {
+      break;
+    }
+  }
+  put32(zlib, (b << 16) | a);
+  chunk("IDAT", zlib);
+  chunk("IEND", std::string());
+  std::filesystem::path temp = path;
+  temp += ".part";
+  {
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+    if (!out || !out.write(file.data(), std::streamsize(file.size()))) {
+      return false;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(temp, path, ec);
+  return !ec;
+}
+
+// pipeline_drop_capture's folder: the log's (log_file), else the working folder's logs, where the
+// logging puts a log without a name.
+std::filesystem::path PipelineDropCaptureFolder() {
+  const std::string log_file = REXCVAR_GET(log_file);
+  if (!log_file.empty()) {
+    std::filesystem::path folder = std::filesystem::u8path(log_file).parent_path();
+    if (!folder.empty()) {
+      return folder;
+    }
+  }
+  return std::filesystem::current_path() / "logs";
+}
 }  // namespace
 
 // A draw IssueDraw dropped because its pipeline wasn't created within the frame's wait budget
@@ -2110,9 +2230,17 @@ void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shade
     counts->depth += depth;
   }
   pipeline_drop_this_frame_ = true;
+  // pipeline_drop_capture: a hole this frame (an overwriting or depth-writing draw dropped), so
+  // its picture is wanted at the swap. Only here on the drop path, so the setting off costs
+  // IssueSwap one flag test.
+  if ((overwriting || depth) && REXCVAR_GET(pipeline_drop_capture)) {
+    pipeline_drop_capture_wanted_ = true;
+    pipeline_drop_frame_overwriting_ += overwriting;
+    pipeline_drop_frame_depth_ += depth;
+  }
 }
 
-void D3D12CommandProcessor::FinishPipelineDropFrame() {
+void D3D12CommandProcessor::FinishPipelineDropFrame(bool check_deadline) {
   // No window pending: one test on a frame end.
   if (!pipeline_drops_window_.draws) {
     return;
@@ -2124,12 +2252,78 @@ void D3D12CommandProcessor::FinishPipelineDropFrame() {
     pipeline_drop_window_wait_max_us_ =
         std::max(pipeline_drop_window_wait_max_us_, pipeline_wait_used_us_);
   }
-  // While a window is pending, every frame end checks its deadline, drops or not: a single drop
-  // followed by quiet frames is logged a second later (a scripted quit's std::_Exit would lose it
-  // if only a later drop closed the window), and a drop after that starts a window of its own
-  // instead of joining an old one.
-  if (PipelineDropNowUs() - pipeline_drop_window_start_us_ >= 1000000) {
+  // A frame whose picture pipeline_drop_capture saves checks later in the same swap, after the
+  // picture, so a window closing at that frame names it.
+  if (check_deadline) {
+    LogPipelineDropsIfDue();
+  }
+}
+
+// While a window is pending, every frame end checks its deadline, drops or not: a single drop
+// followed by quiet frames is logged a second later (a scripted quit's std::_Exit would lose it if
+// only a later drop closed the window), and a drop after that starts a window of its own instead
+// of joining an old one.
+void D3D12CommandProcessor::LogPipelineDropsIfDue() {
+  if (pipeline_drops_window_.draws &&
+      PipelineDropNowUs() - pipeline_drop_window_start_us_ >= 1000000) {
     LogPipelineDrops(false);
+  }
+}
+
+// pipeline_drop_capture: this frame's final picture, the guest output the swap has just refreshed
+// (only the command processor refreshes it, so the newest one CaptureGuestOutput takes is this
+// frame's; it waits until the frame's submission is on the queue and done). Every scale-th pixel of
+// the draw resolution scale, so the file has the guest's size. Named with the frame (the command
+// processor's frame number) and the local time to the millisecond, matching the log's stamps.
+void D3D12CommandProcessor::CapturePipelineDropFrame(ui::Presenter& presenter, uint64_t frame,
+                                                     uint32_t overwriting, uint32_t depth) {
+  const uint32_t max = uint32_t(std::max(0, REXCVAR_GET(pipeline_drop_capture_max)));
+  if (pipeline_drop_captures_saved_ >= max) {
+    if (!pipeline_drop_capture_limit_logged_) {
+      pipeline_drop_capture_limit_logged_ = true;
+      REXGPU_INFO("Pipeline wait: pipeline_drop_capture_max ({}) pictures saved, no more", max);
+    }
+    return;
+  }
+  ui::RawImage image;
+  if (!presenter.CaptureGuestOutput(image) || !image.width || !image.height) {
+    REXGPU_WARN("Pipeline wait: frame {} not saved (no guest output picture)", frame);
+    return;
+  }
+  const uint32_t step_x = std::max(uint32_t(1), texture_cache_->draw_resolution_scale_x());
+  const uint32_t step_y = std::max(uint32_t(1), texture_cache_->draw_resolution_scale_y());
+  const uint32_t width = image.width / step_x;
+  const uint32_t height = image.height / step_y;
+  std::vector<uint8_t> rgb(size_t(width) * height * 3);
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint8_t* src = image.data.data() + size_t(y) * step_y * image.stride;
+    uint8_t* dst = rgb.data() + size_t(y) * width * 3;
+    for (uint32_t x = 0; x < width; ++x) {
+      std::memcpy(dst + size_t(x) * 3, src + size_t(x) * step_x * 4, 3);  // R8 G8 B8 X8
+    }
+  }
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
+  const int64_t ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+  std::tm local = {};
+  localtime_s(&local, &seconds);
+  const std::string name = fmt::format("pipeline-drop-f{}-{:02}{:02}{:02}-{:03}.png", frame,
+                                       local.tm_hour, local.tm_min, local.tm_sec, ms);
+  const std::filesystem::path folder = PipelineDropCaptureFolder();
+  std::error_code ec;
+  std::filesystem::create_directories(folder, ec);
+  if (!WriteStoredRgbPng(folder / name, width, height, rgb)) {
+    REXGPU_WARN("Pipeline wait: frame {} not saved (could not write {})", frame, name);
+    return;
+  }
+  ++pipeline_drop_captures_saved_;
+  REXGPU_INFO(
+      "Pipeline wait: frame {} saved as {} ({} overwriting, {} depth-writing draws dropped in it; "
+      "{} of {})",
+      frame, name, overwriting, depth, pipeline_drop_captures_saved_, max);
+  if (pipeline_drops_window_.draws) {
+    pipeline_drop_window_pictures_ += (pipeline_drop_window_pictures_.empty() ? "" : ", ") + name;
   }
 }
 
@@ -2156,6 +2350,11 @@ void D3D12CommandProcessor::LogPipelineDrops(bool at_exit) {
         pipeline_drop_window_wait_max_us_ / 1000.0, REXCVAR_GET(pipeline_wait_budget_ms),
         pipeline_drop_first_handle_, pipeline_drop_first_vs_hash_, pipeline_drop_first_ps_hash_,
         pipeline_drop_first_overwriting_ ? "overwriting" : "blended or no colour", w.failed);
+    if (!pipeline_drop_window_pictures_.empty()) {
+      // pipeline_drop_capture: the window's saved pictures, on a line of their own right after.
+      REXGPU_INFO("Pipeline wait: that window's pictures: {}", pipeline_drop_window_pictures_);
+      pipeline_drop_window_pictures_.clear();
+    }
     pipeline_drops_window_ = {};
     pipeline_drop_window_wait_us_ = 0;
     pipeline_drop_window_wait_max_us_ = 0;
@@ -2181,8 +2380,18 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // coordinates and came out green on the right and bottom). Once per frame, every vertex buffer is
   // requested again.
   InvalidateAllVertexBufferResidency();
+  // pipeline_drop_capture: this frame dropped an overwriting or depth-writing draw (the flag is
+  // only set with the setting on), so its picture is saved after the refresh below; the frame's
+  // counts are taken here so a swap that returns early doesn't carry them into the next frame.
+  const bool capture_frame = pipeline_drop_capture_wanted_;
+  const uint64_t capture_frame_number = frame_current_;
+  const uint32_t capture_overwriting = pipeline_drop_frame_overwriting_;
+  const uint32_t capture_depth = pipeline_drop_frame_depth_;
+  pipeline_drop_capture_wanted_ = false;
+  pipeline_drop_frame_overwriting_ = 0;
+  pipeline_drop_frame_depth_ = 0;
   // The frame's dropped draws (CountPipelineDrop), while its wait budget use is still known.
-  FinishPipelineDropFrame();
+  FinishPipelineDropFrame(!capture_frame);
   // A new frame gets the whole pipeline_wait_budget_ms again.
   pipeline_wait_used_us_ = 0;
 
@@ -2307,7 +2516,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
   }
 
-  presenter->RefreshGuestOutput(
+  const bool refreshed = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
        guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
@@ -2590,6 +2799,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+
+  // pipeline_drop_capture: this frame's picture, now that its guest output is refreshed and its
+  // work submitted; then the window's deadline, held back above for it.
+  if (capture_frame) {
+    if (refreshed) {
+      CapturePipelineDropFrame(*presenter, capture_frame_number, capture_overwriting,
+                               capture_depth);
+    }
+    LogPipelineDropsIfDue();
+  }
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {

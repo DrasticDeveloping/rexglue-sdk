@@ -799,9 +799,28 @@ class D3D12CommandProcessor : public CommandProcessor {
   void CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
                          const Shader* pixel_shader, uint32_t normalized_color_mask,
                          reg::RB_DEPTHCONTROL normalized_depth_control, bool creation_failed);
-  // At a frame's end (IssueSwap, before the wait budget is reset).
-  void FinishPipelineDropFrame();
+  // At a frame's end (IssueSwap, before the wait budget is reset). check_deadline false: the
+  // window's line waits (LogPipelineDropsIfDue later in the same swap) for this frame's saved
+  // picture.
+  void FinishPipelineDropFrame(bool check_deadline);
+  // Logs the open window's line once its first drop is a second old.
+  void LogPipelineDropsIfDue();
   void LogPipelineDrops(bool at_exit);
+  // pipeline_drop_capture (a debug setting, off by default): the frame's final picture (the guest
+  // output IssueSwap has just refreshed) saved next to the log when the frame dropped a draw that
+  // overwrites colour or writes depth, at most pipeline_drop_capture_max a run. `overwriting` and
+  // `depth`: that frame's counts, for its line.
+  void CapturePipelineDropFrame(ui::Presenter& presenter, uint64_t frame, uint32_t overwriting,
+                                uint32_t depth);
+  // Set on the drop path only (CountPipelineDrop, with the setting on): this frame dropped an
+  // overwriting or depth-writing draw, and how many of each; IssueSwap tests the flag once a frame.
+  bool pipeline_drop_capture_wanted_ = false;
+  uint32_t pipeline_drop_frame_overwriting_ = 0;
+  uint32_t pipeline_drop_frame_depth_ = 0;
+  uint32_t pipeline_drop_captures_saved_ = 0;
+  bool pipeline_drop_capture_limit_logged_ = false;
+  // The pictures saved in the open window, for its line ("; pictures <names>").
+  std::string pipeline_drop_window_pictures_;
   PipelineDropCounts pipeline_drops_window_;
   PipelineDropCounts pipeline_drops_total_;
   bool pipeline_drop_this_frame_ = false;
