@@ -2132,15 +2132,28 @@ bool WriteStoredRgbPng(const std::filesystem::path& path, uint32_t width, uint32
   chunk("IEND", std::string());
   std::filesystem::path temp = path;
   temp += ".part";
+  std::error_code ec;
   {
+    // The close is checked too: a flush that fails at the close (a full disk) would otherwise leave
+    // a truncated file to be renamed and reported as saved. A failed temporary file is removed.
     std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-    if (!out || !out.write(file.data(), std::streamsize(file.size()))) {
+    bool written = out && out.write(file.data(), std::streamsize(file.size()));
+    if (out.is_open()) {
+      out.close();
+      written = written && !out.fail();
+    }
+    if (!written) {
+      std::filesystem::remove(temp, ec);
       return false;
     }
   }
-  std::error_code ec;
   std::filesystem::rename(temp, path, ec);
-  return !ec;
+  if (ec) {
+    std::error_code ignored;
+    std::filesystem::remove(temp, ignored);
+    return false;
+  }
+  return true;
 }
 
 // pipeline_drop_capture's folder: the one the active log file is in, as the logging opened it
