@@ -101,10 +101,13 @@ REXCVAR_DEFINE_INT32(pipeline_wait_budget_ms, 4, "GPU",
 // frame). Safe: the console never drops a draw; the wait is the synchronous path's, on the command
 // processor thread, outside every lock the creation threads take (they take only the queue's and
 // the translation's own); the cost is a hitch the first time a hole-making pipeline is needed, none
-// once it exists or with a warm pipeline cache. A creation still running after
-// kPipelineHoleWaitLimitUs (10 s) makes the fix give up for the run with a warning (the budget
-// again), so a creation that never ends can't hang the game. With async_shader_compilation off it
-// changes nothing (no draw waits for a pending pipeline or is dropped there).
+// once it exists or with a warm pipeline cache. Safety limits, so a creation that never ends can't
+// hang the game: one frame's waits together stop at kPipelineHoleWaitFrameLimitUs (10 s; that
+// frame's other hole-making draws keep the budget), a pipeline whose own waits reach
+// kPipelineHoleWaitPipelineLimitUs (10 s) is given up for the run with a warning naming it (only
+// its draws keep the budget), and a shutdown or a removed device ends a wait at once. With
+// async_shader_compilation off it changes nothing (no draw waits for a pending pipeline or is
+// dropped there). Off, the not-ready path is the old one (no classification before the wait).
 REXCVAR_DEFINE_BOOL(pipeline_wait_hole_draws, true, "GPU",
                     "With async shader compilation: a draw that writes colour without blending, "
                     "depth or stencil waits for its pipeline however long its creation takes, "
@@ -2205,9 +2208,10 @@ std::filesystem::path PipelineDropCaptureFolder() {
 
 // A draw IssueDraw dropped because its pipeline wasn't created within the frame's wait budget
 // (async_shader_compilation, pipeline_wait_budget_ms). Only counts; the draw stays dropped as
-// before. "Overwriting": at least one colour target written whose written channels all have
-// src ONE, dest ZERO, add (Xenos has no blend enable bit; that is blending off), the kind of draw
-// whose absence leaves the target's old pixels instead of a missing object.
+// before. "Overwriting" (ClassifyPipelineDropHole): a written channel group of a target whose
+// result doesn't depend on the destination (Xenos has no blend enable bit; dest factor ZERO with
+// ADD or a subtraction is blending off), the kind of draw whose absence leaves the target's old
+// pixels instead of a missing object.
 void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
                                               const Shader* pixel_shader,
                                               const PipelineDropHole& hole,
@@ -2251,6 +2255,37 @@ void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shade
   }
 }
 
+namespace {
+// Whether a blend group (colour or alpha) writes a result that doesn't depend on the destination:
+// its destination factor is ZERO, its operation adds or subtracts (ADD: src*f, SUBTRACT: src*f - 0,
+// REVSUBTRACT: 0 - src*f), and its source factor reads no destination value. Such a group replaces
+// what the target held, so a dropped draw leaves the old value there. MIN and MAX always read the
+// destination. SRC_ALPHA_SATURATE is min(source alpha, 1 - destination alpha) for the colour group
+// but 1 for the alpha group (dxbc_translator_om.cpp's alpha factor cases), so it reads the
+// destination only in the colour group.
+bool BlendGroupReplacesDestination(xenos::BlendFactor src, xenos::BlendFactor dest,
+                                   xenos::BlendOp op, bool alpha_group) {
+  if (dest != xenos::BlendFactor::kZero) {
+    return false;
+  }
+  if (op != xenos::BlendOp::kAdd && op != xenos::BlendOp::kSubtract &&
+      op != xenos::BlendOp::kRevSubtract) {
+    return false;
+  }
+  switch (src) {
+    case xenos::BlendFactor::kDstColor:
+    case xenos::BlendFactor::kOneMinusDstColor:
+    case xenos::BlendFactor::kDstAlpha:
+    case xenos::BlendFactor::kOneMinusDstAlpha:
+      return false;
+    case xenos::BlendFactor::kSrcAlphaSaturate:
+      return alpha_group;
+    default:
+      return true;
+  }
+}
+}  // namespace
+
 // Only called for a draw whose pipeline isn't ready (the wait's decision and the counter), never on
 // the normal path.
 D3D12CommandProcessor::PipelineDropHole D3D12CommandProcessor::ClassifyPipelineDropHole(
@@ -2283,62 +2318,163 @@ D3D12CommandProcessor::PipelineDropHole D3D12CommandProcessor::ClassifyPipelineD
     }
     auto blend =
         regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
-    bool color_overwrites = !(mask & 0b0111) ||
-                            (blend.color_srcblend == xenos::BlendFactor::kOne &&
-                             blend.color_destblend == xenos::BlendFactor::kZero &&
-                             blend.color_comb_fcn == xenos::BlendOp::kAdd);
-    bool alpha_overwrites = !(mask & 0b1000) ||
-                            (blend.alpha_srcblend == xenos::BlendFactor::kOne &&
-                             blend.alpha_destblend == xenos::BlendFactor::kZero &&
-                             blend.alpha_comb_fcn == xenos::BlendOp::kAdd);
-    overwriting = color_overwrites && alpha_overwrites;
+    // Per written group: a draw that replaces the colour while it keeps the destination's alpha (or
+    // the reverse) still leaves a hole in the group it replaces.
+    const bool color_replaces =
+        (mask & 0b0111) && BlendGroupReplacesDestination(blend.color_srcblend,
+                                                         blend.color_destblend,
+                                                         blend.color_comb_fcn, false);
+    const bool alpha_replaces =
+        (mask & 0b1000) && BlendGroupReplacesDestination(blend.alpha_srcblend,
+                                                         blend.alpha_destblend,
+                                                         blend.alpha_comb_fcn, true);
+    overwriting = color_replaces || alpha_replaces;
   }
   PipelineDropHole hole;
   hole.overwriting = overwriting;
   hole.depth = (used_slots & 1) && normalized_depth_control.z_enable &&
                normalized_depth_control.z_write_enable;
   if ((used_slots & 1) && normalized_depth_control.stencil_enable) {
-    // Stencil written: the front faces' write mask, or the back faces' when they test their own.
-    const bool front = regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0;
-    const bool back =
-        normalized_depth_control.backface_enable &&
+    // Stencil that can change, judged on the side of waiting. An operation other than KEEP counts
+    // on an outcome that can happen: the stencil test failing (unless it always passes), the depth
+    // test failing (depth on and not ALWAYS, the stencil test not NEVER), both passing (the stencil
+    // test not NEVER and the depth test able to pass: depth off or not NEVER). The pipeline
+    // (PipelineCache::GetCurrentStateDescription) has one write mask for both faces, the back
+    // faces' only when front faces are culled, and the back faces' operations only for polygonal
+    // primitives with backface_enable; here a write mask counts if either face's is non-zero, the
+    // back faces' operations count whenever backface_enable is set, and culling isn't looked at.
+    // That can add a wait the pipeline wouldn't need, never miss a write it can make.
+    const bool z_can_fail = normalized_depth_control.z_enable &&
+                            normalized_depth_control.zfunc != xenos::CompareFunction::kAlways;
+    const bool z_can_pass = !normalized_depth_control.z_enable ||
+                            normalized_depth_control.zfunc != xenos::CompareFunction::kNever;
+    auto ops_change = [z_can_fail, z_can_pass](xenos::CompareFunction func, xenos::StencilOp fail,
+                                               xenos::StencilOp zfail, xenos::StencilOp zpass) {
+      const bool fail_reachable = func != xenos::CompareFunction::kAlways;
+      const bool pass_reachable = func != xenos::CompareFunction::kNever;
+      return (fail_reachable && fail != xenos::StencilOp::kKeep) ||
+             (pass_reachable && z_can_fail && zfail != xenos::StencilOp::kKeep) ||
+             (pass_reachable && z_can_pass && zpass != xenos::StencilOp::kKeep);
+    };
+    const bool masked =
+        regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0 ||
         regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilwritemask != 0;
-    hole.stencil = front || back;
+    if (masked) {
+      hole.stencil = ops_change(normalized_depth_control.stencilfunc,
+                                normalized_depth_control.stencilfail,
+                                normalized_depth_control.stencilzfail,
+                                normalized_depth_control.stencilzpass) ||
+                     (normalized_depth_control.backface_enable &&
+                      ops_change(normalized_depth_control.stencilfunc_bf,
+                                 normalized_depth_control.stencilfail_bf,
+                                 normalized_depth_control.stencilzfail_bf,
+                                 normalized_depth_control.stencilzpass_bf));
+    }
   }
   return hole;
 }
 
-// pipeline_wait_hole_draws: one draw waited `wait_us` for its pipeline instead of being dropped.
-void D3D12CommandProcessor::CountPipelineHoleWait(int64_t wait_us, const PipelineDropHole& hole) {
-  if (!pipeline_hole_waits_window_.draws) {
+ID3D12PipelineState* D3D12CommandProcessor::WaitForHolePipeline(void* pipeline_handle,
+                                                                int64_t limit_us,
+                                                                bool& cancelled) {
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  auto stopping = [this, device]() {
+    return !worker_running_ || device->GetDeviceRemovedReason() != S_OK;
+  };
+  cancelled = stopping();
+  if (cancelled) {
+    return nullptr;
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::microseconds(std::max(int64_t(0), limit_us));
+  while (true) {
+    // WaitForPipeline returns as soon as the creation is done; the slice only bounds how long a
+    // shutdown or a removed device goes unnoticed.
+    const auto slice_end =
+        std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(1));
+    ID3D12PipelineState* state = pipeline_cache_->WaitForPipeline(pipeline_handle, slice_end);
+    if (state || pipeline_cache_->IsPipelineCreationFailed(pipeline_handle)) {
+      return state;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return nullptr;
+    }
+    if (stopping()) {
+      cancelled = true;
+      return nullptr;
+    }
+  }
+}
+
+// pipeline_wait_hole_draws: one hole-making draw whose pipeline wasn't ready, and what came of it.
+// Every outcome's time counts against the frame's limit and in the worst frame, a failed creation's
+// too (a creation can fail after a long wait). A failed one opens no window of its own (a failed
+// pipeline's draws come every frame): it goes into an open window and the total.
+void D3D12CommandProcessor::CountPipelineHoleWait(int64_t wait_us, const PipelineDropHole& hole,
+                                                  PipelineHoleWaitOutcome outcome) {
+  pipeline_hole_wait_this_frame_ = true;
+  pipeline_hole_wait_frame_us_ += wait_us;
+  if (outcome == PipelineHoleWaitOutcome::kFailed) {
+    if (PipelineHoleWaitWindowPending()) {
+      ++pipeline_hole_waits_window_.failed;
+      pipeline_hole_waits_window_.wait_us += wait_us;
+    }
+    ++pipeline_hole_waits_total_.failed;
+    pipeline_hole_waits_total_.wait_us += wait_us;
+    return;
+  }
+  if (!PipelineHoleWaitWindowPending()) {
     pipeline_hole_wait_window_start_us_ = PipelineDropNowUs();
   }
   for (PipelineHoleWaitCounts* counts :
        {&pipeline_hole_waits_window_, &pipeline_hole_waits_total_}) {
-    ++counts->draws;
-    counts->overwriting += hole.overwriting;
-    counts->depth_or_stencil += hole.depth || hole.stencil;
+    if (outcome == PipelineHoleWaitOutcome::kDrawn) {
+      ++counts->draws;
+      counts->overwriting += hole.overwriting;
+      counts->depth_or_stencil += hole.depth || hole.stencil;
+    } else if (outcome == PipelineHoleWaitOutcome::kCancelled) {
+      ++counts->cancelled;
+    } else {
+      ++counts->timed_out;
+    }
     counts->wait_us += wait_us;
   }
-  pipeline_hole_wait_this_frame_ = true;
-  pipeline_hole_wait_frame_us_ += wait_us;
+}
+
+void D3D12CommandProcessor::PrunePipelineHoleWaitState() {
+  for (auto it = pipeline_hole_wait_pipeline_us_.begin();
+       it != pipeline_hole_wait_pipeline_us_.end();) {
+    it = pipeline_cache_->IsPipelineCreationDone(it->first)
+             ? pipeline_hole_wait_pipeline_us_.erase(it)
+             : std::next(it);
+  }
+  for (auto it = pipeline_hole_wait_given_up_.begin(); it != pipeline_hole_wait_given_up_.end();) {
+    it = pipeline_cache_->IsPipelineCreationDone(*it) ? pipeline_hole_wait_given_up_.erase(it)
+                                                      : std::next(it);
+  }
 }
 
 void D3D12CommandProcessor::FinishPipelineHoleWaitFrame() {
-  // No window pending: one test on a frame end.
-  if (!pipeline_hole_waits_window_.draws) {
+  // Nothing waited this frame and no window pending: a few tests on a frame end.
+  const bool window = PipelineHoleWaitWindowPending();
+  if (!window && !pipeline_hole_wait_this_frame_) {
     return;
   }
   if (pipeline_hole_wait_this_frame_) {
     pipeline_hole_wait_this_frame_ = false;
-    for (PipelineHoleWaitCounts* counts :
-         {&pipeline_hole_waits_window_, &pipeline_hole_waits_total_}) {
-      ++counts->frames;
-      counts->frame_max_us = std::max(counts->frame_max_us, pipeline_hole_wait_frame_us_);
+    ++pipeline_hole_waits_total_.frames;
+    pipeline_hole_waits_total_.frame_max_us =
+        std::max(pipeline_hole_waits_total_.frame_max_us, pipeline_hole_wait_frame_us_);
+    if (window) {
+      ++pipeline_hole_waits_window_.frames;
+      pipeline_hole_waits_window_.frame_max_us =
+          std::max(pipeline_hole_waits_window_.frame_max_us, pipeline_hole_wait_frame_us_);
     }
+    // A new frame gets the whole kPipelineHoleWaitFrameLimitUs again.
     pipeline_hole_wait_frame_us_ = 0;
+    pipeline_hole_wait_frame_limit_logged_ = false;
   }
-  if (PipelineDropNowUs() - pipeline_hole_wait_window_start_us_ >= 1000000) {
+  if (window && PipelineDropNowUs() - pipeline_hole_wait_window_start_us_ >= 1000000) {
     LogPipelineHoleWaits(false);
   }
 }
@@ -2346,7 +2482,7 @@ void D3D12CommandProcessor::FinishPipelineHoleWaitFrame() {
 // One line per window with waits, at most one a second (the window's first wait to the first frame
 // end a second later); at exit the open window's line and the summary, zeros included.
 void D3D12CommandProcessor::LogPipelineHoleWaits(bool at_exit) {
-  if (pipeline_hole_waits_window_.draws) {
+  if (PipelineHoleWaitWindowPending()) {
     if (pipeline_hole_wait_this_frame_) {
       // At exit with the frame still open.
       pipeline_hole_wait_this_frame_ = false;
@@ -2361,18 +2497,21 @@ void D3D12CommandProcessor::LogPipelineHoleWaits(bool at_exit) {
     REXGPU_INFO(
         "Pipeline wait: {} draws waited for their pipelines in {} frames over the last {} ms (they "
         "would have left holes: {} overwriting, {} writing depth or stencil); {:.1f} ms in all, at "
-        "most {:.1f} ms in one frame (pipeline_wait_hole_draws)",
+        "most {:.1f} ms in one frame; {} timed out, {} cancelled, {} of failed pipelines "
+        "(pipeline_wait_hole_draws)",
         w.draws, w.frames, (PipelineDropNowUs() - pipeline_hole_wait_window_start_us_) / 1000,
-        w.overwriting, w.depth_or_stencil, w.wait_us / 1000.0, w.frame_max_us / 1000.0);
+        w.overwriting, w.depth_or_stencil, w.wait_us / 1000.0, w.frame_max_us / 1000.0,
+        w.timed_out, w.cancelled, w.failed);
     pipeline_hole_waits_window_ = {};
   }
   if (at_exit) {
     const PipelineHoleWaitCounts& t = pipeline_hole_waits_total_;
     REXGPU_INFO(
         "Pipeline wait: {} draws waited for their pipelines in all, in {} frames, {:.1f} ms in "
-        "all, at most {:.1f} ms in one frame (pipeline_wait_hole_draws {})",
-        t.draws, t.frames, t.wait_us / 1000.0, t.frame_max_us / 1000.0,
-        REXCVAR_GET(pipeline_wait_hole_draws) ? "on" : "off");
+        "all, at most {:.1f} ms in one frame; {} timed out, {} cancelled, {} of failed pipelines "
+        "(pipeline_wait_hole_draws {})",
+        t.draws, t.frames, t.wait_us / 1000.0, t.frame_max_us / 1000.0, t.timed_out, t.cancelled,
+        t.failed, REXCVAR_GET(pipeline_wait_hole_draws) ? "on" : "off");
   }
 }
 
@@ -2566,8 +2705,9 @@ void D3D12CommandProcessor::LogPipelineDrops(bool at_exit) {
     }
     const PipelineDropCounts& w = pipeline_drops_window_;
     REXGPU_INFO(
-        "Pipeline wait: {} draws dropped in {} frames over the last {} ms, {} overwriting (colour "
-        "written without blending), {} writing depth; waited {:.1f} ms in those frames (at most "
+        "Pipeline wait: {} draws dropped in {} frames over the last {} ms, {} overwriting (a "
+        "written channel group replacing its destination), {} writing depth; waited {:.1f} ms in "
+        "those frames (at most "
         "{:.1f} ms in one, budget {} ms); first: pipeline {} VS {:016X} PS {:016X} ({}); {} more "
         "of failed pipelines; window {}{}{}",
         w.draws, w.frames, (PipelineDropNowUs() - pipeline_drop_window_start_us_) / 1000,
@@ -2626,8 +2766,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   // The frame's dropped draws (CountPipelineDrop), while its wait budget use is still known.
   FinishPipelineDropFrame(!capture_frame);
-  // The frame's waits of hole-making draws (pipeline_wait_hole_draws).
+  // The frame's waits of hole-making draws (pipeline_wait_hole_draws), and the per-pipeline entries
+  // of pipelines whose creation has finished (two tests while none are kept).
   FinishPipelineHoleWaitFrame();
+  if (!pipeline_hole_wait_pipeline_us_.empty() || !pipeline_hole_wait_given_up_.empty()) {
+    PrunePipelineHoleWaitState();
+  }
   // A new frame gets the whole pipeline_wait_budget_ms again.
   pipeline_wait_used_us_ = 0;
 
@@ -3230,38 +3374,84 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // -> 7 per run with 4 ms, the rest in loading screens).
     ID3D12PipelineState* waited = nullptr;
     const int64_t budget_us = int64_t(REXCVAR_GET(pipeline_wait_budget_ms)) * 1000;
-    // pipeline_wait_hole_draws: a draw that would leave a hole (colour written without blending,
-    // depth or stencil) waits for its pipeline however long its creation takes, as the synchronous
-    // path does; only the safety limit ends it. Classified only here, for a pipeline not ready.
-    const PipelineDropHole hole =
-        ClassifyPipelineDropHole(normalized_color_mask, normalized_depth_control);
-    const bool wait_whole = REXCVAR_GET(pipeline_wait_hole_draws) &&
-                            !pipeline_hole_wait_gave_up_ &&
-                            (hole.overwriting || hole.depth || hole.stencil);
-    if (wait_whole || pipeline_wait_used_us_ < budget_us) {
+    // pipeline_wait_hole_draws: a draw that would leave a hole (a written channel group replacing
+    // its destination, depth or stencil that can change) waits for its pipeline however long its
+    // creation takes, as the synchronous path does; only the safety limit ends it. Classified only
+    // with the setting on: off, the path below is the old one (the budget's wait, and the counter
+    // classifies a draw only once it is dropped).
+    PipelineDropHole hole;
+    bool hole_classified = false;
+    bool wait_whole = false;
+    if (REXCVAR_GET(pipeline_wait_hole_draws)) {
+      hole = ClassifyPipelineDropHole(normalized_color_mask, normalized_depth_control);
+      hole_classified = true;
+      if (hole.overwriting || hole.depth || hole.stencil) {
+        if (pipeline_hole_wait_given_up_.count(pipeline_handle)) {
+          // Given up for this pipeline (its warning came then): the budget, as before the fix.
+        } else if (pipeline_hole_wait_frame_us_ >= kPipelineHoleWaitFrameLimitUs) {
+          if (!pipeline_hole_wait_frame_limit_logged_) {
+            pipeline_hole_wait_frame_limit_logged_ = true;
+            REXGPU_WARN(
+                "Pipeline wait: this frame's waits for pipelines reached {} s; its other draws "
+                "that would leave a hole keep the budget",
+                kPipelineHoleWaitFrameLimitUs / 1000000);
+          }
+        } else {
+          wait_whole = true;
+        }
+      }
+    }
+    if (wait_whole) {
+      // As long as the creation takes, within what is left of BOTH the frame's limit and this
+      // pipeline's own (its earlier timed-out waits, any frame).
+      const auto pipeline_used_it = pipeline_hole_wait_pipeline_us_.find(pipeline_handle);
+      const int64_t pipeline_used =
+          pipeline_used_it != pipeline_hole_wait_pipeline_us_.end() ? pipeline_used_it->second : 0;
+      const int64_t limit_us =
+          std::min(kPipelineHoleWaitFrameLimitUs - pipeline_hole_wait_frame_us_,
+                   kPipelineHoleWaitPipelineLimitUs - pipeline_used);
+      bool cancelled = false;
       const auto wait_start = std::chrono::steady_clock::now();
-      waited = pipeline_cache_->WaitForPipeline(
-          pipeline_handle,
-          wait_start + std::chrono::microseconds(wait_whole
-                                                     ? kPipelineHoleWaitLimitUs
-                                                     : budget_us - pipeline_wait_used_us_));
+      waited = WaitForHolePipeline(pipeline_handle, limit_us, cancelled);
       const int64_t waited_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - wait_start)
                                     .count();
       // The wait counts against the frame's budget too, so the blended draws after it in the same
       // frame don't add their own waits to the hitch.
       pipeline_wait_used_us_ += waited_us;
-      if (wait_whole) {
-        CountPipelineHoleWait(waited_us, hole);
-        if (!waited && !pipeline_cache_->IsPipelineCreationFailed(pipeline_handle)) {
-          pipeline_hole_wait_gave_up_ = true;
+      const bool failed = !waited && pipeline_cache_->IsPipelineCreationFailed(pipeline_handle);
+      CountPipelineHoleWait(waited_us, hole,
+                            waited      ? PipelineHoleWaitOutcome::kDrawn
+                            : failed    ? PipelineHoleWaitOutcome::kFailed
+                            : cancelled ? PipelineHoleWaitOutcome::kCancelled
+                                        : PipelineHoleWaitOutcome::kTimedOut);
+      if (waited || failed) {
+        // Its creation has finished: its own allowance and give-up are retired.
+        pipeline_hole_wait_pipeline_us_.erase(pipeline_handle);
+        pipeline_hole_wait_given_up_.erase(pipeline_handle);
+      }
+      if (!waited && !failed && !cancelled) {
+        // Timed out: this pipeline's own waits, summed; at the limit it is given up for the run.
+        int64_t& pipeline_us = pipeline_hole_wait_pipeline_us_[pipeline_handle];
+        pipeline_us += waited_us;
+        if (pipeline_us >= kPipelineHoleWaitPipelineLimitUs &&
+            pipeline_hole_wait_given_up_.insert(pipeline_handle).second) {
           REXGPU_WARN(
-              "Pipeline wait: a draw that would leave a hole waited {} s for its pipeline, still "
-              "being created; pipeline_wait_hole_draws gives up for this run (such draws keep the "
-              "budget again)",
-              kPipelineHoleWaitLimitUs / 1000000);
+              "Pipeline wait: pipeline {} VS {:016X} PS {:016X} still being created after {:.1f} s "
+              "of waits; its draws that would leave a hole keep the budget from now on (the other "
+              "pipelines keep waiting)",
+              pipeline_handle, vertex_shader->ucode_data_hash(),
+              pixel_shader ? pixel_shader->ucode_data_hash() : 0, pipeline_us / 1000000.0);
         }
       }
+    } else if (pipeline_wait_used_us_ < budget_us) {
+      const auto wait_start = std::chrono::steady_clock::now();
+      waited = pipeline_cache_->WaitForPipeline(
+          pipeline_handle,
+          wait_start + std::chrono::microseconds(budget_us - pipeline_wait_used_us_));
+      pipeline_wait_used_us_ += std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - wait_start)
+                                    .count();
     }
     if (!waited) {
       // Dropped: counted and logged (CountPipelineDrop). The render target cache's Update above
@@ -3269,10 +3459,38 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // written keep the targets' old contents for this frame. A pipeline whose creation failed
       // (WaitForPipeline returns nullptr for it with time left too) is told apart from one still
       // being created and counted on its own; the drop and the wait accounting are the same.
-      CountPipelineDrop(pipeline_handle, *vertex_shader, pixel_shader, hole,
-                        pipeline_cache_->IsPipelineCreationFailed(pipeline_handle));
+      // A known failure first: its drop needs no classification (the counter's failed branch
+      // doesn't use it), so with pipeline_wait_hole_draws off nothing is classified for it.
+      const bool failed = pipeline_cache_->IsPipelineCreationFailed(pipeline_handle);
+      if (!failed && !hole_classified) {
+        hole = ClassifyPipelineDropHole(normalized_color_mask, normalized_depth_control);
+      }
+      // A hole-making draw lost to a failed creation is named here, once per pipeline, whichever
+      // way it came (a failed wait, a pipeline given up first, a frame past its limit).
+      if (failed && hole_classified && (hole.overwriting || hole.depth || hole.stencil) &&
+          pipeline_hole_failed_logged_.insert(pipeline_handle).second) {
+        REXGPU_WARN(
+            "Pipeline wait: pipeline {} VS {:016X} PS {:016X} failed to create; its draws that "
+            "would leave a hole ({}{}{}) are dropped",
+            pipeline_handle, vertex_shader->ucode_data_hash(),
+            pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+            hole.overwriting ? "overwriting " : "", hole.depth ? "depth " : "",
+            hole.stencil ? "stencil" : "");
+      }
+      CountPipelineDrop(pipeline_handle, *vertex_shader, pixel_shader, hole, failed);
       return true;
     }
+  }
+
+  // With async shader compilation the pipeline is ready now (it was, or the wait above saw it), but
+  // the root signature ConfigurePipeline gave was the one published when it looked the pipeline up:
+  // for a pipeline still being created then, the placeholder without the pixel shader's textures
+  // (PipelineCache::GetCurrentStateDescription with for_placeholder; bindful devices only, bindless
+  // ones use one root signature per tessellation mode). Binding with it while the pipeline was
+  // created with the final one is worse than dropping the draw, so the draw takes the one published
+  // with the pipeline (its creation thread stores it before the pipeline). One atomic load a draw.
+  if (REXCVAR_GET(async_shader_compilation)) {
+    root_signature = pipeline_cache_->GetRootSignatureByHandle(pipeline_handle);
   }
 
   // Update the textures - this may bind pipelines.
