@@ -3275,6 +3275,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // With async shader compilation the pipeline is ready now (it was, or the wait above saw it), but
+  // the root signature ConfigurePipeline gave was the one published when it looked the pipeline up:
+  // for a pipeline still being created then, the placeholder without the pixel shader's textures
+  // (PipelineCache::GetCurrentStateDescription with for_placeholder; bindful devices only, bindless
+  // ones use one root signature per tessellation mode). Binding with it while the pipeline was
+  // created with the final one is worse than dropping the draw, so the draw takes the one published
+  // with the pipeline (its creation thread stores it before the pipeline). One atomic load a draw.
+  if (REXCVAR_GET(async_shader_compilation)) {
+    root_signature = pipeline_cache_->GetRootSignatureByHandle(pipeline_handle);
+  }
+
   // Update the textures - this may bind pipelines.
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
