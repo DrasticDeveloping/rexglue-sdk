@@ -2043,7 +2043,17 @@ int64_t PipelineDropNowUs() {
 void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
                                               const Shader* pixel_shader,
                                               uint32_t normalized_color_mask,
-                                              reg::RB_DEPTHCONTROL normalized_depth_control) {
+                                              reg::RB_DEPTHCONTROL normalized_depth_control,
+                                              bool creation_failed) {
+  if (creation_failed) {
+    // A failed pipeline, not a pending one: its own counter, into a window already open and the
+    // session's total, and no window of its own (PipelineDropCounts::failed).
+    if (pipeline_drops_window_.draws) {
+      ++pipeline_drops_window_.failed;
+    }
+    ++pipeline_drops_total_.failed;
+    return;
+  }
   const RegisterFile& regs = *register_file_;
   // On the host render target path only the targets the render target cache really gave this draw
   // count (bit 0 depth, 1... color): it leaves out a color target sharing its EDRAM base with a
@@ -2139,12 +2149,13 @@ void D3D12CommandProcessor::LogPipelineDrops(bool at_exit) {
     REXGPU_INFO(
         "Pipeline wait: {} draws dropped in {} frames over the last {} ms, {} overwriting (colour "
         "written without blending), {} writing depth; waited {:.1f} ms in those frames (at most "
-        "{:.1f} ms in one, budget {} ms); first: pipeline {} VS {:016X} PS {:016X} ({})",
+        "{:.1f} ms in one, budget {} ms); first: pipeline {} VS {:016X} PS {:016X} ({}); {} more "
+        "of failed pipelines",
         w.draws, w.frames, (PipelineDropNowUs() - pipeline_drop_window_start_us_) / 1000,
         w.overwriting, w.depth, pipeline_drop_window_wait_us_ / 1000.0,
         pipeline_drop_window_wait_max_us_ / 1000.0, REXCVAR_GET(pipeline_wait_budget_ms),
         pipeline_drop_first_handle_, pipeline_drop_first_vs_hash_, pipeline_drop_first_ps_hash_,
-        pipeline_drop_first_overwriting_ ? "overwriting" : "blended or no colour");
+        pipeline_drop_first_overwriting_ ? "overwriting" : "blended or no colour", w.failed);
     pipeline_drops_window_ = {};
     pipeline_drop_window_wait_us_ = 0;
     pipeline_drop_window_wait_max_us_ = 0;
@@ -2152,9 +2163,9 @@ void D3D12CommandProcessor::LogPipelineDrops(bool at_exit) {
   if (at_exit) {
     const PipelineDropCounts& t = pipeline_drops_total_;
     REXGPU_INFO(
-        "Pipeline wait: {} draws dropped in all, in {} frames, {} overwriting, {} writing depth "
-        "(async_shader_compilation {}, pipeline_wait_budget_ms {})",
-        t.draws, t.frames, t.overwriting, t.depth,
+        "Pipeline wait: {} draws dropped in all, in {} frames, {} overwriting, {} writing depth, "
+        "{} more of failed pipelines (async_shader_compilation {}, pipeline_wait_budget_ms {})",
+        t.draws, t.frames, t.overwriting, t.depth, t.failed,
         REXCVAR_GET(async_shader_compilation) ? "on" : "off",
         REXCVAR_GET(pipeline_wait_budget_ms));
   }
@@ -2764,9 +2775,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     if (!waited) {
       // Dropped: counted and logged (CountPipelineDrop). The render target cache's Update above
       // has already claimed and transferred the targets, so the pixels this draw would have
-      // written keep the targets' old contents for this frame.
+      // written keep the targets' old contents for this frame. A pipeline whose creation failed
+      // (WaitForPipeline returns nullptr for it with time left too) is told apart from one still
+      // being created and counted on its own; the drop and the wait accounting are the same.
       CountPipelineDrop(pipeline_handle, *vertex_shader, pixel_shader, normalized_color_mask,
-                        normalized_depth_control);
+                        normalized_depth_control,
+                        pipeline_cache_->IsPipelineCreationFailed(pipeline_handle));
       return true;
     }
   }

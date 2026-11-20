@@ -791,10 +791,14 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t overwriting = 0;
     // Had depth writes on.
     uint64_t depth = 0;
+    // Dropped because their pipeline's creation had FAILED (not pending): dropped the same way, but
+    // counted apart and not in the counts above, opening no window of their own (the creation
+    // logged the failure once; a failed pipeline's draws come every frame).
+    uint64_t failed = 0;
   };
   void CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
                          const Shader* pixel_shader, uint32_t normalized_color_mask,
-                         reg::RB_DEPTHCONTROL normalized_depth_control);
+                         reg::RB_DEPTHCONTROL normalized_depth_control, bool creation_failed);
   // At a frame's end (IssueSwap, before the wait budget is reset).
   void FinishPipelineDropFrame();
   void LogPipelineDrops(bool at_exit);
