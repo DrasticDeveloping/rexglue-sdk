@@ -105,14 +105,16 @@ REXCVAR_DEFINE_BOOL(pipeline_drop_capture, false, "GPU",
                     "Debug: save the final picture of a frame in which a draw that overwrites "
                     "colour or writes depth was dropped while its pipeline was being created, next "
                     "to the log (at most pipeline_drop_capture_max a run); it stalls that frame")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
 
 // pipeline_drop_capture's limit: pictures saved per run (each about 2.8 MB at 1280x720), so a load
 // with hundreds of drops doesn't fill the disk or stall frame after frame.
 REXCVAR_DEFINE_INT32(pipeline_drop_capture_max, 8, "GPU",
                      "Debug: at most this many pictures saved per run by pipeline_drop_capture")
     .range(0, 1000)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
 
 namespace rex::graphics::d3d12 {
 
