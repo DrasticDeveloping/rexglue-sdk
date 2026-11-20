@@ -865,8 +865,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   // worst frame waited 26.6 ms under the old budget), so only a hung creation reaches them.
   static constexpr int64_t kPipelineHoleWaitFrameLimitUs = 10 * 1000 * 1000;
   static constexpr int64_t kPipelineHoleWaitPipelineLimitUs = 10 * 1000 * 1000;
+  // A pipeline's entries live as long as it is being created: a wait that ends with it ready or
+  // failed retires them, and PrunePipelineHoleWaitState (at a frame end, only while any are kept)
+  // retires those whose creation finished while their draws took the budget or the ready path.
+  // The handles stay valid until PipelineCache::Shutdown (the cache clear keeps the pipelines).
   std::unordered_map<void*, int64_t> pipeline_hole_wait_pipeline_us_;
   std::unordered_set<void*> pipeline_hole_wait_given_up_;
+  void PrunePipelineHoleWaitState();
   bool pipeline_hole_wait_frame_limit_logged_ = false;
   // Waits for a pending pipeline at most `limit_us`. A shutdown (worker_running_ off) or a removed
   // device is checked before the wait starts and every millisecond while it runs, and ends it at

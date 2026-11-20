@@ -2441,6 +2441,19 @@ void D3D12CommandProcessor::CountPipelineHoleWait(int64_t wait_us, const Pipelin
   }
 }
 
+void D3D12CommandProcessor::PrunePipelineHoleWaitState() {
+  for (auto it = pipeline_hole_wait_pipeline_us_.begin();
+       it != pipeline_hole_wait_pipeline_us_.end();) {
+    it = pipeline_cache_->IsPipelineCreationDone(it->first)
+             ? pipeline_hole_wait_pipeline_us_.erase(it)
+             : std::next(it);
+  }
+  for (auto it = pipeline_hole_wait_given_up_.begin(); it != pipeline_hole_wait_given_up_.end();) {
+    it = pipeline_cache_->IsPipelineCreationDone(*it) ? pipeline_hole_wait_given_up_.erase(it)
+                                                      : std::next(it);
+  }
+}
+
 void D3D12CommandProcessor::FinishPipelineHoleWaitFrame() {
   // Nothing waited this frame and no window pending: a few tests on a frame end.
   const bool window = PipelineHoleWaitWindowPending();
@@ -2753,8 +2766,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   }
   // The frame's dropped draws (CountPipelineDrop), while its wait budget use is still known.
   FinishPipelineDropFrame(!capture_frame);
-  // The frame's waits of hole-making draws (pipeline_wait_hole_draws).
+  // The frame's waits of hole-making draws (pipeline_wait_hole_draws), and the per-pipeline entries
+  // of pipelines whose creation has finished (two tests while none are kept).
   FinishPipelineHoleWaitFrame();
+  if (!pipeline_hole_wait_pipeline_us_.empty() || !pipeline_hole_wait_given_up_.empty()) {
+    PrunePipelineHoleWaitState();
+  }
   // A new frame gets the whole pipeline_wait_budget_ms again.
   pipeline_wait_used_us_ = 0;
 
@@ -3408,6 +3425,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                             : failed    ? PipelineHoleWaitOutcome::kFailed
                             : cancelled ? PipelineHoleWaitOutcome::kCancelled
                                         : PipelineHoleWaitOutcome::kTimedOut);
+      if (waited || failed) {
+        // Its creation has finished: its own allowance and give-up are retired.
+        pipeline_hole_wait_pipeline_us_.erase(pipeline_handle);
+        pipeline_hole_wait_given_up_.erase(pipeline_handle);
+      }
       if (!waited && !failed && !cancelled) {
         // Timed out: this pipeline's own waits, summed; at the limit it is given up for the run.
         int64_t& pipeline_us = pipeline_hole_wait_pipeline_us_[pipeline_handle];

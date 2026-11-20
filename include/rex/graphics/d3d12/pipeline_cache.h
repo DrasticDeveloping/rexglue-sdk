@@ -120,6 +120,10 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->root_signature.load(
         std::memory_order_acquire);
   }
+  // Whether the creation of the pipeline behind the handle has finished (a pipeline or a failure).
+  bool IsPipelineCreationDone(void* handle) const {
+    return reinterpret_cast<const Pipeline*>(handle)->done.load(std::memory_order_acquire);
+  }
   // Whether the pipeline behind the handle has finished creation without a pipeline (a failure,
   // logged by its creation), as opposed to one still being created. For the dropped-draw counter.
   bool IsPipelineCreationFailed(void* handle) const {
