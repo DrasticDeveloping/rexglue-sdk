@@ -800,8 +800,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   // What a draw whose pipeline isn't ready would leave behind if dropped, from the targets the
   // render target cache really gave it (host render target path; the interlock path reads the
-  // register state): `overwriting`, colour written without blending to a target; `depth`, depth
-  // written; `stencil`, stencil written. Any of them: a hole (the targets' old contents) for that
+  // register state): `overwriting`, a written channel group (colour or alpha) of a target whose
+  // result doesn't depend on the destination (it replaces it); `depth`, depth written; `stencil`,
+  // stencil that can change. Any of them: a hole (the targets' old contents) for that
   // frame. None: a blended draw or one writing nothing, an object missing for a frame.
   struct PipelineDropHole {
     bool overwriting = false;

@@ -2205,9 +2205,10 @@ std::filesystem::path PipelineDropCaptureFolder() {
 
 // A draw IssueDraw dropped because its pipeline wasn't created within the frame's wait budget
 // (async_shader_compilation, pipeline_wait_budget_ms). Only counts; the draw stays dropped as
-// before. "Overwriting": at least one colour target written whose written channels all have
-// src ONE, dest ZERO, add (Xenos has no blend enable bit; that is blending off), the kind of draw
-// whose absence leaves the target's old pixels instead of a missing object.
+// before. "Overwriting" (ClassifyPipelineDropHole): a written channel group of a target whose result
+// doesn't depend on the destination (Xenos has no blend enable bit; dest factor ZERO with ADD or a
+// subtraction is blending off), the kind of draw whose absence leaves the target's old pixels
+// instead of a missing object.
 void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shader& vertex_shader,
                                               const Shader* pixel_shader,
                                               const PipelineDropHole& hole,
@@ -2251,6 +2252,34 @@ void D3D12CommandProcessor::CountPipelineDrop(void* pipeline_handle, const Shade
   }
 }
 
+namespace {
+// Whether a blend group (colour or alpha) writes a result that doesn't depend on the destination:
+// its destination factor is ZERO, its operation adds or subtracts (ADD: src*f, SUBTRACT: src*f - 0,
+// REVSUBTRACT: 0 - src*f), and its source factor reads no destination value. Such a group replaces
+// what the target held, so a dropped draw leaves the old value there. MIN and MAX always read the
+// destination.
+bool BlendGroupReplacesDestination(xenos::BlendFactor src, xenos::BlendFactor dest,
+                                   xenos::BlendOp op) {
+  if (dest != xenos::BlendFactor::kZero) {
+    return false;
+  }
+  if (op != xenos::BlendOp::kAdd && op != xenos::BlendOp::kSubtract &&
+      op != xenos::BlendOp::kRevSubtract) {
+    return false;
+  }
+  switch (src) {
+    case xenos::BlendFactor::kDstColor:
+    case xenos::BlendFactor::kOneMinusDstColor:
+    case xenos::BlendFactor::kDstAlpha:
+    case xenos::BlendFactor::kOneMinusDstAlpha:
+    case xenos::BlendFactor::kSrcAlphaSaturate:  // min(source alpha, 1 - destination alpha)
+      return false;
+    default:
+      return true;
+  }
+}
+}  // namespace
+
 // Only called for a draw whose pipeline isn't ready (the wait's decision and the counter), never on
 // the normal path.
 D3D12CommandProcessor::PipelineDropHole D3D12CommandProcessor::ClassifyPipelineDropHole(
@@ -2283,15 +2312,17 @@ D3D12CommandProcessor::PipelineDropHole D3D12CommandProcessor::ClassifyPipelineD
     }
     auto blend =
         regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
-    bool color_overwrites = !(mask & 0b0111) ||
-                            (blend.color_srcblend == xenos::BlendFactor::kOne &&
-                             blend.color_destblend == xenos::BlendFactor::kZero &&
-                             blend.color_comb_fcn == xenos::BlendOp::kAdd);
-    bool alpha_overwrites = !(mask & 0b1000) ||
-                            (blend.alpha_srcblend == xenos::BlendFactor::kOne &&
-                             blend.alpha_destblend == xenos::BlendFactor::kZero &&
-                             blend.alpha_comb_fcn == xenos::BlendOp::kAdd);
-    overwriting = color_overwrites && alpha_overwrites;
+    // Per written group: a draw that replaces the colour while it keeps the destination's alpha (or
+    // the reverse) still leaves a hole in the group it replaces.
+    const bool color_replaces =
+        (mask & 0b0111) && BlendGroupReplacesDestination(blend.color_srcblend,
+                                                         blend.color_destblend,
+                                                         blend.color_comb_fcn);
+    const bool alpha_replaces =
+        (mask & 0b1000) && BlendGroupReplacesDestination(blend.alpha_srcblend,
+                                                         blend.alpha_destblend,
+                                                         blend.alpha_comb_fcn);
+    overwriting = color_replaces || alpha_replaces;
   }
   PipelineDropHole hole;
   hole.overwriting = overwriting;
@@ -2566,8 +2597,9 @@ void D3D12CommandProcessor::LogPipelineDrops(bool at_exit) {
     }
     const PipelineDropCounts& w = pipeline_drops_window_;
     REXGPU_INFO(
-        "Pipeline wait: {} draws dropped in {} frames over the last {} ms, {} overwriting (colour "
-        "written without blending), {} writing depth; waited {:.1f} ms in those frames (at most "
+        "Pipeline wait: {} draws dropped in {} frames over the last {} ms, {} overwriting (a "
+        "written channel group replacing its destination), {} writing depth; waited {:.1f} ms in "
+        "those frames (at most "
         "{:.1f} ms in one, budget {} ms); first: pipeline {} VS {:016X} PS {:016X} ({}); {} more "
         "of failed pipelines; window {}{}{}",
         w.draws, w.frames, (PipelineDropNowUs() - pipeline_drop_window_start_us_) / 1000,
