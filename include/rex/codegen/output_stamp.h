@@ -39,9 +39,16 @@ struct OutputStamp {
 /// input contributes a "missing" marker, so a file appearing later still
 /// changes the fingerprint. sdkVersion must be stable across commits
 /// (floor plus channel, e.g. "0.10.0-dev").
+///
+/// `selfWritten` names the one input codegen rewrites itself (the manifest, whose
+/// sdk_version stamp it writes with LF line ends). That input is hashed with each
+/// CR LF read as LF, so a checkout's CR LF copy of it (git's core.autocrlf) and
+/// codegen's own rewrite give the same fingerprint; otherwise a fresh checkout
+/// regenerates identical code, and then again after its own rewrite.
 std::string ComputeInputFingerprint(std::span<const std::filesystem::path> inputFiles,
                                     std::string_view sdkVersion,
-                                    std::span<const std::string> flagValues);
+                                    std::span<const std::string> flagValues,
+                                    const std::filesystem::path& selfWritten = {});
 
 bool OutputsAreUpToDate(const OutputStamp& stamp, std::string_view fingerprint,
                         const std::filesystem::path& outputDir);

@@ -76,6 +76,13 @@ void InitLoggingEarly();
 void ShutdownLogging();
 
 /**
+ * The file the file sink writes to, made absolute when the sink was created (from log_file, or the
+ * sequential name in log_dir), or an empty path when there is no file sink. For files a debug
+ * feature writes beside the log (the GPU's pipeline_drop_capture). Callable from any thread.
+ */
+std::filesystem::path ActiveLogFilePath();
+
+/**
  * Flush all loggers without tearing down the logging system.
  *
  * Use before a hard process exit (std::_Exit) when other threads may still be

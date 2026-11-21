@@ -966,6 +966,23 @@ uint32_t RenderTargetCache::GetLastUpdateBoundRenderTargets(
   return rts_used;
 }
 
+uint32_t RenderTargetCache::GetLastUpdateUsedRenderTargetBits() const {
+  // last_update_used_render_targets_ is written at the end of every successful host render target
+  // update (above, after the targets sharing an EDRAM base were left out) and cleared by the early
+  // return of an update that binds nothing; the interlock path returns before both, so the array
+  // isn't this draw's there.
+  if (GetPath() != Path::kHostRenderTargets) {
+    return 0;
+  }
+  uint32_t rts_used = 0;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (last_update_used_render_targets_[i]) {
+      rts_used |= uint32_t(1) << i;
+    }
+  }
+  return rts_used;
+}
+
 uint32_t RenderTargetCache::GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
                                                   xenos::MsaaSamples msaa_samples) const {
   if (!pitch_tiles_at_32bpp) {

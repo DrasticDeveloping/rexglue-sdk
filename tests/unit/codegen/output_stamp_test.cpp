@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <rex/codegen/config.h>
+#include <rex/codegen/manifest.h>
 #include <rex/codegen/output_stamp.h>
 
 namespace fs = std::filesystem;
@@ -224,6 +226,59 @@ TEST_CASE("Depfile escapes characters make treats as syntax", "[output_stamp]") 
   std::ifstream in(depfile, std::ios::binary);
   std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
-  CHECK(content.find("has\ space.toml") != std::string::npos);
-  CHECK(content.find("hash\#.toml") != std::string::npos);
+  CHECK(content.find("has\\ space.toml") != std::string::npos);
+  CHECK(content.find("hash\\#.toml") != std::string::npos);
+}
+
+TEST_CASE("The self-written input fingerprints the same with CR LF or LF line ends",
+          "[output_stamp]") {
+  Scratch scratch("self_written");
+  fs::create_directories(scratch.root / "lf");
+  fs::create_directories(scratch.root / "crlf");
+  auto lf = scratch.WriteFile("lf/game_manifest.toml", "[project]\nname = \"x\"\n");
+  auto crlf = scratch.WriteFile("crlf/game_manifest.toml", "[project]\r\nname = \"x\"\r\n");
+  std::vector<std::string> flags;
+  std::vector<fs::path> lfInputs{lf};
+  std::vector<fs::path> crlfInputs{crlf};
+
+  // A checkout's CR LF copy matches codegen's own LF rewrite, and the LF form keeps the
+  // fingerprint it had before (stamps written by an earlier SDK stay valid).
+  CHECK(ComputeInputFingerprint(crlfInputs, "1.2.3", flags, crlf) ==
+        ComputeInputFingerprint(lfInputs, "1.2.3", flags, lf));
+  CHECK(ComputeInputFingerprint(lfInputs, "1.2.3", flags, lf) ==
+        ComputeInputFingerprint(lfInputs, "1.2.3", flags));
+  // Any other input still counts byte for byte.
+  CHECK(ComputeInputFingerprint(crlfInputs, "1.2.3", flags) !=
+        ComputeInputFingerprint(lfInputs, "1.2.3", flags));
+  // A lone CR is content, not a line end.
+  auto cr = scratch.WriteFile("crlf/game_manifest.toml", "[project]\rname = \"x\"\n");
+  CHECK(ComputeInputFingerprint(crlfInputs, "1.2.3", flags, cr) !=
+        ComputeInputFingerprint(lfInputs, "1.2.3", flags, lf));
+}
+
+TEST_CASE("Stamping an up-to-date manifest leaves the file alone", "[output_stamp]") {
+  Scratch scratch("manifest_stamp");
+  auto manifest =
+      scratch.WriteFile("game_manifest.toml", "[project]\nname = \"x\"\nsdk_version = \"0.10.0\"\n");
+  auto old = fs::last_write_time(manifest) - std::chrono::hours(1);
+  fs::last_write_time(manifest, old);
+
+  REQUIRE(ManifestConfig::WriteSdkVersionStamp(manifest, "0.10.0"));
+  CHECK(fs::last_write_time(manifest) == old);
+
+  REQUIRE(ManifestConfig::WriteSdkVersionStamp(manifest, "0.11.0"));
+  std::ifstream in(manifest, std::ios::binary);
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  CHECK(content == "[project]\nname = \"x\"\nsdk_version = \"0.11.0\"\n");
+}
+
+TEST_CASE("Stamping a CR LF manifest rewrites it with LF line ends", "[output_stamp]") {
+  Scratch scratch("manifest_crlf");
+  auto manifest = scratch.WriteFile("game_manifest.toml",
+                                    "[project]\r\nname = \"x\"\r\nsdk_version = \"0.10.0\"\r\n");
+
+  REQUIRE(ManifestConfig::WriteSdkVersionStamp(manifest, "0.10.0"));
+  std::ifstream in(manifest, std::ios::binary);
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  CHECK(content == "[project]\nname = \"x\"\nsdk_version = \"0.10.0\"\n");
 }

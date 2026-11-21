@@ -289,6 +289,10 @@ spdlog::sink_ptr AddedSink(const spdlog::sink_ptr& sink) {
 std::vector<LogCategoryEntry> g_registry;
 spdlog::sink_ptr g_console_sink;
 spdlog::sink_ptr g_file_sink;
+// ActiveLogFilePath: the file sink's path, absolute, as it was opened; its own lock, since it is
+// read from other threads (the GPU's command processor).
+std::mutex g_log_file_path_mutex;
+std::filesystem::path g_log_file_path;
 spdlog::sink_ptr g_early_sink;
 std::vector<spdlog::sink_ptr> g_extra_sinks;
 bool g_early_initialized = false;
@@ -955,6 +959,19 @@ void InitLogging(const LogConfig& config) {
                                           : std::filesystem::path(config.log_dir);
     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
   }
+  {
+    // ActiveLogFilePath: absolute now, while the working directory is the one the sink opens in.
+    std::error_code ec;
+    std::filesystem::path absolute;
+    if (!resolved_path.empty()) {
+      absolute = std::filesystem::absolute(std::filesystem::u8path(resolved_path), ec);
+      if (ec) {
+        absolute = std::filesystem::u8path(resolved_path);
+      }
+    }
+    std::lock_guard lock(g_log_file_path_mutex);
+    g_log_file_path = absolute;
+  }
   if (!resolved_path.empty()) {
     auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
         resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
@@ -1153,6 +1170,11 @@ bool EnableAsyncLogging() {
   // Marks the switch in the log (another thread's line can be queued just before it).
   REXLOG_INFO("Log: asynchronous from now on, queue {} lines, one writer", queue);
   return true;
+}
+
+std::filesystem::path ActiveLogFilePath() {
+  std::lock_guard lock(g_log_file_path_mutex);
+  return g_log_file_path;
 }
 
 void ShutdownLogging() {

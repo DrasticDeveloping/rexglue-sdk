@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <vector>
@@ -189,7 +190,9 @@ bool LineSetsKey(std::string_view line, std::string_view key) {
 
 bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
                                           std::string_view version) {
-  std::ifstream in(path);
+  // Binary, and each line's CR dropped here: the stamped manifest has LF line ends on every
+  // platform (a text-mode read drops the CR only on Windows).
+  std::ifstream in(path, std::ios::binary);
   if (!in) {
     REXLOG_ERROR("Failed to open manifest for stamping: {}", path.string());
     return false;
@@ -197,6 +200,8 @@ bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
   std::vector<std::string> lines;
   std::string buf;
   while (std::getline(in, buf)) {
+    if (!buf.empty() && buf.back() == '\r')
+      buf.pop_back();
     lines.push_back(std::move(buf));
     buf.clear();
   }
@@ -233,6 +238,23 @@ bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
     lines.push_back(stamp_line);
   }
 
+  std::string content;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    content += lines[i];
+    if (i + 1 < lines.size())
+      content += '\n';
+  }
+  content += '\n';
+
+  // Unchanged: leave the file and its time alone. A rewrite on every run made the manifest newer
+  // than codegen's build stamp, so every build ran codegen again.
+  {
+    std::ifstream current(path, std::ios::binary);
+    std::string existing((std::istreambuf_iterator<char>(current)), std::istreambuf_iterator<char>());
+    if (current && existing == content)
+      return true;
+  }
+
   auto tmp_path = path;
   tmp_path += ".tmp";
   {
@@ -241,12 +263,7 @@ bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
       REXLOG_ERROR("Failed to open manifest tmp for writing: {}", tmp_path.string());
       return false;
     }
-    for (size_t i = 0; i < lines.size(); ++i) {
-      out << lines[i];
-      if (i + 1 < lines.size())
-        out << '\n';
-    }
-    out << '\n';
+    out << content;
     if (!out.good()) {
       REXLOG_ERROR("Failed while writing manifest tmp: {}", tmp_path.string());
       std::error_code ignore;

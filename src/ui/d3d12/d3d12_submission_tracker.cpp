@@ -70,11 +70,21 @@ bool D3D12SubmissionTracker::AwaitSubmissionCompletion(UINT64 submission_index) 
     TrySignalEnqueueing();
     fence_value = submission_signal_queued_;
   }
-  if (fence_->GetCompletedValue() < fence_value) {
+  // A removed device makes GetCompletedValue return UINT64_MAX, which is no completion: the work
+  // never ran, and a caller that reads its results back (a guest output capture mapping its
+  // readback buffer) must not go on. So the sentinel fails the wait, before it and after it.
+  UINT64 completed = fence_->GetCompletedValue();
+  if (completed == UINT64_MAX) {
+    return false;
+  }
+  if (completed < fence_value) {
     if (FAILED(fence_->SetEventOnCompletion(fence_value, fence_completion_event_))) {
       return false;
     }
     if (WaitForSingleObject(fence_completion_event_, INFINITE) != WAIT_OBJECT_0) {
+      return false;
+    }
+    if (fence_->GetCompletedValue() == UINT64_MAX) {
       return false;
     }
   }

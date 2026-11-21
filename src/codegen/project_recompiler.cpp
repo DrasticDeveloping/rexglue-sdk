@@ -78,7 +78,8 @@ std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& c
 
 std::string FingerprintModule(const RecompilerConfig& cfg,
                               std::span<const std::filesystem::path> inputs,
-                              std::string_view sdkVersion) {
+                              std::string_view sdkVersion,
+                              const std::filesystem::path& manifestPath) {
   std::vector<std::string> flags{
       fmt::format("templates={}", EmbeddedTemplatesHash()),
       fmt::format("generate_exception_handlers={}", cfg.generateExceptionHandlers),
@@ -97,7 +98,8 @@ std::string FingerprintModule(const RecompilerConfig& cfg,
       fmt::format("max_blocks_per_function={}", REXCVAR_GET(max_blocks_per_function)),
   };
 
-  return ComputeInputFingerprint(inputs, sdkVersion, flags);
+  // The manifest is the input codegen rewrites itself (its sdk_version stamp, LF line ends).
+  return ComputeInputFingerprint(inputs, sdkVersion, flags, manifestPath);
 }
 
 void ReportBinaryInfo(ProgressReporter* reporter, std::string_view display_name,
@@ -360,7 +362,8 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     auto outDir = entry.ctx.configDir() / entry.ctx.Config().outDirectoryPath;
     auto inputs =
         CollectModuleInputs(entry.ctx.Config(), entry.ctx.configDir(), manifest_.manifestPath);
-    fingerprints[i] = FingerprintModule(entry.ctx.Config(), inputs, opts.sdkVersion);
+    fingerprints[i] =
+        FingerprintModule(entry.ctx.Config(), inputs, opts.sdkVersion, manifest_.manifestPath);
     allInputs.insert(allInputs.end(), inputs.begin(), inputs.end());
 
     if (opts.ignoreStamp || opts.force)

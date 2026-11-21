@@ -111,6 +111,26 @@ class PipelineCache {
     }
     return pipeline->state.load(std::memory_order_acquire);
   }
+  // The root signature the pipeline behind the handle is (or will be) created with. A pipeline
+  // created asynchronously starts with a placeholder (no pixel shader textures; the shader isn't
+  // translated yet), and its creation thread publishes the final one before the pipeline itself
+  // (PrepareRuntimeDescriptionForQueuedCreation, then state and done with release order), so once
+  // the pipeline is seen ready this returns the one it was created with.
+  ID3D12RootSignature* GetRootSignatureByHandle(void* handle) const {
+    return reinterpret_cast<const Pipeline*>(handle)->root_signature.load(
+        std::memory_order_acquire);
+  }
+  // Whether the creation of the pipeline behind the handle has finished (a pipeline or a failure).
+  bool IsPipelineCreationDone(void* handle) const {
+    return reinterpret_cast<const Pipeline*>(handle)->done.load(std::memory_order_acquire);
+  }
+  // Whether the pipeline behind the handle has finished creation without a pipeline (a failure,
+  // logged by its creation), as opposed to one still being created. For the dropped-draw counter.
+  bool IsPipelineCreationFailed(void* handle) const {
+    const Pipeline* pipeline = reinterpret_cast<const Pipeline*>(handle);
+    return pipeline->done.load(std::memory_order_acquire) &&
+           !pipeline->state.load(std::memory_order_acquire);
+  }
 
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
